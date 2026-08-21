@@ -33,6 +33,17 @@ redirect). If a file is too large for either, delivery automatically falls
 back to just sending the link instead of the actual bytes -- nothing
 breaks, the customer just gets a link instead of an attachment.
 
+PRODUCT MENU: customers can browse all your products two ways --
+    1. Persistent menu -- the hamburger icon inside the Messenger chat
+       window, with a "View Products" item. Requires one manual setup
+       call after deploying (and again whenever products change): visit
+       POST /setup-messenger-profile once.
+    2. Just typing a word like "menu" (or your own configured words via
+       MENU_TRIGGER_KEYWORDS) sends the same product carousel.
+Both show a scrollable carousel (Facebook's generic template, max 10
+items) with a "Buy" button per product, wired to the same QPay flow as
+the keyword-comment trigger.
+
 Configure products via environment variables on Render:
 
     PRODUCT_1_KEYWORDS=no.1,no1
@@ -141,6 +152,32 @@ EMAIL_INVALID_TEXT = os.environ.get(
     "EMAIL_INVALID_TEXT",
     "Уучлаарай, имэйл хаяг зөв бичигдээгүй байна. Дахин оролдоно уу.",
 )
+
+# --- Product menu settings ---
+# Words that trigger the product menu when a customer just types a message
+# (as opposed to commenting a specific product's keyword). Comma-separated,
+# case-insensitive, matched as "the message contains this word".
+MENU_TRIGGER_KEYWORDS = [
+    k.strip().lower()
+    for k in os.environ.get("MENU_TRIGGER_KEYWORDS", "menu,цэс,каталог,jagsaalt,жагсаалт").split(",")
+    if k.strip()
+]
+# Sent once, the first time someone opens the chat (Messenger's "Get
+# Started" button), right before showing the menu.
+WELCOME_TEXT = os.environ.get(
+    "WELCOME_TEXT",
+    "\U0001F44B Сайн байна уу! Манай дэлгүүрт тавтай морил.",
+)
+MENU_INTRO_TEXT = os.environ.get(
+    "MENU_INTRO_TEXT",
+    "\U0001F6CD\uFE0F Манай бүтээгдэхүүнүүд:",
+)
+NO_PRODUCTS_TEXT = os.environ.get(
+    "NO_PRODUCTS_TEXT",
+    "Уучлаарай, одоогоор бүтээгдэхүүн тохируулагдаагүй байна.",
+)
+BUY_BUTTON_TEXT = os.environ.get("BUY_BUTTON_TEXT", "Худалдаж авах")
+VIEW_PRODUCTS_MENU_LABEL = os.environ.get("VIEW_PRODUCTS_MENU_LABEL", "\U0001F6CD\uFE0F Бүтээгдэхүүнүүд харах")
 
 BUSINESS_NAME = os.environ.get("BUSINESS_NAME", "This business")
 CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "")
@@ -352,6 +389,73 @@ async def send_pay_button(recipient: dict, product: Product) -> None:
             }
         },
     )
+
+
+async def send_product_menu(psid: str) -> None:
+    """Sends a scrollable carousel of every configured product, each with
+    its own 'Buy' button. This is what shows up when a customer taps the
+    persistent menu's 'View Products' item, or just types something like
+    'menu'. Facebook's generic template caps out at 10 elements -- if you
+    configure more than 10 products, only the first 10 appear here (the
+    keyword-comment flow still works for all of them regardless)."""
+    if not PRODUCTS:
+        await send_meta_message({"id": psid}, {"text": NO_PRODUCTS_TEXT})
+        return
+
+    await send_meta_message({"id": psid}, {"text": MENU_INTRO_TEXT})
+
+    elements = [
+        {
+            "title": product.description,
+            "subtitle": f"{product.amount:.0f}\u20ae",
+            "buttons": [
+                {"type": "postback", "title": BUY_BUTTON_TEXT, "payload": product.payload}
+            ],
+        }
+        for product in PRODUCTS[:10]
+    ]
+
+    await send_meta_message(
+        {"id": psid},
+        {
+            "attachment": {
+                "type": "template",
+                "payload": {"template_type": "generic", "elements": elements},
+            }
+        },
+    )
+
+
+async def setup_messenger_profile() -> None:
+    """One-time (or run-again-whenever-products-change) setup call that
+    configures the persistent menu (the hamburger/menu icon inside the
+    Messenger chat window) and the 'Get Started' button new users see
+    before their first message. Meta requires Get Started to be set for
+    the persistent menu to appear at all. Call this by hitting
+    POST /setup-messenger-profile once after deploying, and again anytime
+    you add/remove products."""
+    url = f"{GRAPH_API_BASE}/me/messenger_profile"
+    params = {"access_token": META_PAGE_ACCESS_TOKEN}
+    payload = {
+        "get_started": {"payload": "GET_STARTED"},
+        "persistent_menu": [
+            {
+                "locale": "default",
+                "composer_input_disabled": False,
+                "call_to_actions": [
+                    {
+                        "type": "postback",
+                        "title": VIEW_PRODUCTS_MENU_LABEL,
+                        "payload": "VIEW_PRODUCTS",
+                    }
+                ],
+            }
+        ],
+    }
+    async with httpx.AsyncClient() as http_client:
+        resp = await http_client.post(url, params=params, json=payload)
+        logger.info("Messenger profile setup response: %s %s", resp.status_code, resp.text)
+        resp.raise_for_status()
 
 
 async def send_file_via_messenger(psid: str, product: Product) -> bool:
@@ -629,6 +733,16 @@ async def handle_messaging_event(event: dict) -> None:
     postback = event.get("postback")
     if postback:
         payload = postback.get("payload", "")
+
+        if payload == "GET_STARTED":
+            await send_meta_message({"id": sender_id}, {"text": WELCOME_TEXT})
+            await send_product_menu(sender_id)
+            return
+
+        if payload == "VIEW_PRODUCTS":
+            await send_product_menu(sender_id)
+            return
+
         if not payload.startswith("QPAY_PAY_"):
             return
         try:
@@ -653,11 +767,19 @@ async def handle_messaging_event(event: dict) -> None:
         )
         return
 
-    # Not a postback -- check if we're waiting on an email reply from this
-    # person for a completed order.
+    # Not a postback.
     message = event.get("message", {})
     text = (message.get("text") or "").strip()
-    if not text or sender_id not in AWAITING_EMAIL:
+    if not text:
+        return
+
+    # If they're not mid-email-capture, check whether they just typed a
+    # menu trigger word (e.g. "menu", "цэс") -- if so, show the product
+    # carousel and stop there.
+    if sender_id not in AWAITING_EMAIL:
+        text_lower = text.lower()
+        if any(kw in text_lower for kw in MENU_TRIGGER_KEYWORDS):
+            await send_product_menu(sender_id)
         return
 
     order_id = AWAITING_EMAIL[sender_id]
@@ -766,6 +888,31 @@ async def test_deliver(psid: str, product_index: int = 1, secret: str = ""):
     }
     await deliver_digital_product(order_id)
     return {"status": "sent", "order_id": order_id}
+
+
+@app.post("/setup-messenger-profile")
+async def setup_messenger_profile_endpoint(secret: str = ""):
+    """Run this ONCE after deploying (visit the URL in a browser, or POST
+    to it -- e.g. https://your-app.onrender.com/setup-messenger-profile),
+    and again any time you add/remove products, to push the persistent
+    menu + Get Started button to your Facebook Page. This is a one-time
+    configuration call to Meta, not something that needs to run on every
+    request."""
+    if TEST_ENDPOINT_SECRET and secret != TEST_ENDPOINT_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid or missing secret")
+    await setup_messenger_profile()
+    return {"status": "messenger profile updated"}
+
+
+@app.post("/test-menu")
+async def test_menu(psid: str, secret: str = ""):
+    """TEST-ONLY: sends the product menu carousel to a given PSID, so you
+    can check it looks right without needing to type 'menu' in Messenger
+    yourself first."""
+    if TEST_ENDPOINT_SECRET and secret != TEST_ENDPOINT_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid or missing secret")
+    await send_product_menu(psid)
+    return {"status": "sent"}
 
 
 @app.get("/")
