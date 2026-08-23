@@ -200,7 +200,7 @@ NO_PRODUCTS_TEXT = os.environ.get(
     "NO_PRODUCTS_TEXT",
     "Уучлаарай, одоогоор бүтээгдэхүүн тохируулагдаагүй байна.",
 )
-BUY_BUTTON_TEXT = os.environ.get("BUY_BUTTON_TEXT", "Худалдаж авах")
+BUY_BUTTON_TEXT = os.environ.get("BUY_BUTTON_TEXT", "\u0430\u0432\u0430\u0445")
 VIEW_PRODUCTS_MENU_LABEL = os.environ.get("VIEW_PRODUCTS_MENU_LABEL", "\U0001F6CD\uFE0F Бүтээгдэхүүнүүд харах")
 
 # Sent when a customer types something that isn't a recognized menu word
@@ -530,7 +530,7 @@ async def send_pay_button(recipient: dict, product: Product) -> None:
                     "template_type": "button",
                     "text": f"{product.description} -- {product.amount:.0f}\u20ae",
                     "buttons": [
-                        {"type": "postback", "title": "Qpay-ээр төлөх", "payload": product.payload}
+                        {"type": "postback", "title": BUY_BUTTON_TEXT, "payload": product.payload}
                     ],
                 },
             }
