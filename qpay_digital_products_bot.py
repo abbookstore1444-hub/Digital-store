@@ -189,6 +189,17 @@ NO_PRODUCTS_TEXT = os.environ.get(
 BUY_BUTTON_TEXT = os.environ.get("BUY_BUTTON_TEXT", "Худалдаж авах")
 VIEW_PRODUCTS_MENU_LABEL = os.environ.get("VIEW_PRODUCTS_MENU_LABEL", "\U0001F6CD\uFE0F Бүтээгдэхүүнүүд харах")
 
+# Sent when a customer types something that isn't a recognized menu word
+# and they're not in the middle of the email-collection flow. Keeps the
+# bot from going silent on ordinary chat messages it doesn't understand.
+FALLBACK_REPLY_TEXT = os.environ.get(
+    "FALLBACK_REPLY_TEXT",
+    "\U0001F44B Уучлаарай, би зөвхөн энгийн асуултад хариулдаг туслах бот учраас "
+    "таны бичсэнийг ойлгосонгүй.\n\n"
+    "\U0001F6CD\uFE0F Бүтээгдэхүүн харахыг хүсвэл \"menu\" гэж бичнэ үү, "
+    "эсвэл доорх цэсийг ашиглана уу.",
+)
+
 BUSINESS_NAME = os.environ.get("BUSINESS_NAME", "This business")
 CONTACT_EMAIL = os.environ.get("CONTACT_EMAIL", "")
 
@@ -875,11 +886,14 @@ async def handle_messaging_event(event: dict) -> None:
 
     # If they're not mid-email-capture, check whether they just typed a
     # menu trigger word (e.g. "menu", "цэс") -- if so, show the product
-    # carousel and stop there.
+    # carousel. Otherwise, send a friendly fallback instead of going
+    # silent, so the bot doesn't feel broken when someone just says "hi".
     if sender_id not in AWAITING_EMAIL:
         text_lower = text.lower()
         if any(kw in text_lower for kw in MENU_TRIGGER_KEYWORDS):
             await send_product_menu(sender_id)
+        else:
+            await send_meta_message({"id": sender_id}, {"text": FALLBACK_REPLY_TEXT})
         return
 
     order_id = AWAITING_EMAIL[sender_id]
