@@ -477,8 +477,22 @@ async def get_customer_name(psid: str) -> str:
         async with httpx.AsyncClient() as http_client:
             resp = await http_client.get(url, params=params)
             data = resp.json()
+
+        if "error" in data:
+            # Facebook can decline to share a name for many reasons: the
+            # customer's privacy settings, your app's permission level for
+            # Business Asset User Profile Access (Standard access may only
+            # work reliably for admins/testers until App Review approves
+            # it), or the PSID being stale. Logging this is the only way
+            # to tell "genuinely blank" apart from "Facebook said no".
+            logger.warning(
+                "Could not fetch name for psid=%s: %s", psid, data["error"],
+            )
+            return ""
+
         return f"{data.get('first_name', '')} {data.get('last_name', '')}".strip()
-    except Exception:
+    except Exception as e:
+        logger.warning("Exception fetching name for psid=%s: %s", psid, e)
         return ""
 
 
