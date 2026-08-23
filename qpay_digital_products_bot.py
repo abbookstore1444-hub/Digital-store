@@ -6,16 +6,17 @@ a Pay button -> pay via QPay -> get your thing), but "your thing" here is a
 downloadable file (PDF / ebook) stored in Google Drive, instead of a
 Facebook Group invite or a video.
 
-DELIVERY: after a customer pays, they get the file THREE ways:
+DELIVERY: after a customer pays, they get the file via Messenger:
     1. A Google Drive link, sent immediately in Messenger.
     2. The actual file, sent as a Messenger attachment (best-effort --
        Facebook fetches it directly from Drive, so this costs Render
        nothing regardless of file size).
-    3. The bot then asks the customer for their email address. Once they
-       reply with one, it emails them the Drive link via plain SMTP. By
-       default the email does NOT attach the actual file -- attaching
-       would mean downloading it onto Render first, using bandwidth and
-       memory there. Set EMAIL_ATTACH_FILES=true if you want the email to
+    3. OPTIONAL email step (off by default): set ENABLE_EMAIL_DELIVERY=true
+       to also have the bot ask for an email address and send the Drive
+       link there via plain SMTP. By default the email does NOT attach the
+       actual file -- attaching would mean downloading it onto Render
+       first, using bandwidth and memory there. Set EMAIL_ATTACH_FILES=true
+       (in addition to ENABLE_EMAIL_DELIVERY) if you want the email to
        include the real file as an attachment instead of just a link.
 
 WHY GOOGLE DRIVE, NO API NEEDED: each product's file just needs to be
@@ -215,12 +216,18 @@ SMTP_PASSWORD = os.environ.get("SMTP_PASSWORD", "")
 SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL", SMTP_USERNAME)
 SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", BUSINESS_NAME)
 
+# Master switch for the whole email step. When off, the bot never asks for
+# an email after payment, and just skips straight from delivery to done --
+# Messenger (link + file attachment) remains the only delivery channel.
+# Set to "true" to re-enable asking for email.
+ENABLE_EMAIL_DELIVERY = os.environ.get("ENABLE_EMAIL_DELIVERY", "false").lower() == "true"
+
 # Whether to actually download the file from Drive and attach it to the
 # email. Defaults to OFF -- emails just include the Drive link instead,
 # which costs zero Render bandwidth/memory. Set to "true" to attach the
 # real file to emails (Messenger delivery already sends the actual file
 # separately either way, at no cost to Render, since Facebook fetches it
-# directly from Drive).
+# directly from Drive). Has no effect if ENABLE_EMAIL_DELIVERY is off.
 EMAIL_ATTACH_FILES = os.environ.get("EMAIL_ATTACH_FILES", "false").lower() == "true"
 
 # Max file size we'll try to download+attach to an email, if
@@ -758,9 +765,10 @@ async def deliver_digital_product(order_id: str) -> None:
 
     await send_file_via_messenger(psid, product)
 
-    # Ask for email so we can send a copy there too.
-    await send_meta_message({"id": psid}, {"text": ASK_EMAIL_TEXT})
-    AWAITING_EMAIL[psid] = order_id
+    if ENABLE_EMAIL_DELIVERY:
+        # Ask for email so we can send a copy there too.
+        await send_meta_message({"id": psid}, {"text": ASK_EMAIL_TEXT})
+        AWAITING_EMAIL[psid] = order_id
 
 
 # ---------------------------------------------------------------------------
@@ -894,6 +902,7 @@ async def handle_messaging_event(event: dict) -> None:
             await send_product_menu(sender_id)
         else:
             await send_meta_message({"id": sender_id}, {"text": FALLBACK_REPLY_TEXT})
+            await send_product_menu(sender_id)
         return
 
     order_id = AWAITING_EMAIL[sender_id]
