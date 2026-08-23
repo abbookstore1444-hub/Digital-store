@@ -828,11 +828,20 @@ async def handle_feed_change(value: dict) -> None:
 
     product = find_matching_product(comment_text)
     if not product:
+        commenter_id = (value.get("from") or {}).get("id")
         if FALLBACK_REPLY_TEXT:
             try:
                 await send_meta_message({"comment_id": comment_id}, {"text": FALLBACK_REPLY_TEXT})
             except Exception as e:
                 logger.warning("Failed to send fallback private reply for comment %s: %s", comment_id, e)
+        # The private reply above can only use comment_id ONCE (Meta's
+        # limit) -- any further message needs the commenter's actual ID,
+        # which is available once that private-reply thread exists.
+        if commenter_id:
+            try:
+                await send_product_menu(commenter_id)
+            except Exception as e:
+                logger.warning("Failed to send product menu to commenter %s: %s", commenter_id, e)
         return
 
     try:
