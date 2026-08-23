@@ -505,6 +505,14 @@ AWAITING_EMAIL: dict[str, str] = {}
 # Tracks which PSIDs we're currently waiting on a payment screenshot from
 # (manual payment mode only), and which order it's for.
 AWAITING_PAYMENT_SCREENSHOT: dict[str, str] = {}
+# Caches a customer's public name whenever they comment on a Page post --
+# Meta includes it directly in the feed webhook payload (it's already
+# public, visible on the comment itself), unlike fetching a Messenger
+# user's name via the Graph API, which is locked down for most apps and
+# reliably fails with error_subcode 33. Used as the preferred source for
+# customer_name in orders, since the direct Graph API lookup often can't
+# get a name at all.
+COMMENTER_NAMES: dict[str, str] = {}
 
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -847,9 +855,18 @@ async def handle_feed_change(value: dict) -> None:
     if not comment_id:
         return
 
+    # Cache the commenter's public name -- Meta gives us this for free on
+    # every comment, unlike the Graph API profile lookup used elsewhere,
+    # which is locked down for most apps. Do this regardless of whether
+    # the comment matches a product, so it's available if they buy later.
+    from_field = value.get("from") or {}
+    commenter_id = from_field.get("id")
+    commenter_name = from_field.get("name")
+    if commenter_id and commenter_name:
+        COMMENTER_NAMES[commenter_id] = commenter_name
+
     product = find_matching_product(comment_text)
     if not product:
-        commenter_id = (value.get("from") or {}).get("id")
         if FALLBACK_REPLY_TEXT:
             try:
                 await send_meta_message({"comment_id": comment_id}, {"text": FALLBACK_REPLY_TEXT})
@@ -905,7 +922,10 @@ async def handle_messaging_event(event: dict) -> None:
         if not product:
             return
 
-        customer_name = await get_customer_name(sender_id)
+        # Prefer the name we already have from a public comment (reliable,
+        # no special permission needed) over the Graph API profile lookup,
+        # which is locked down for most apps and often returns nothing.
+        customer_name = COMMENTER_NAMES.get(sender_id) or await get_customer_name(sender_id)
         order_id = f"{sender_id}-{product_index}-{uuid.uuid4().hex[:6]}"
 
         if PAYMENT_MODE == "manual":
