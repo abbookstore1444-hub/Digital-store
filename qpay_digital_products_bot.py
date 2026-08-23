@@ -6,24 +6,18 @@ a Pay button -> pay via QPay -> get your thing), but "your thing" here is a
 downloadable file (PDF / ebook) stored in Google Drive, instead of a
 Facebook Group invite or a video.
 
-DELIVERY: after a customer pays, they get the file via Messenger:
-    1. A Google Drive link, sent immediately in Messenger.
-    2. The actual file, sent as a Messenger attachment. Facebook fetches it
-       from our own /files/{product_index} endpoint (not Drive directly),
-       which downloads it from Drive server-side first -- this uses a bit
-       of Render bandwidth/memory per delivery, capped by MAX_ATTACHMENT_MB.
-       This detour exists because Drive often serves a "can't scan for
-       viruses" confirmation page instead of the real file when fetched
-       programmatically, which Facebook can't use as an attachment
-       (error 2018007). Routing through our own server lets us handle that
-       confirmation step first, so Facebook always gets real file bytes.
-    3. OPTIONAL email step (off by default): set ENABLE_EMAIL_DELIVERY=true
-       to also have the bot ask for an email address and send the Drive
-       link there via plain SMTP. By default the email does NOT attach the
-       actual file -- attaching would mean downloading it onto Render
-       first, using bandwidth and memory there. Set EMAIL_ATTACH_FILES=true
-       (in addition to ENABLE_EMAIL_DELIVERY) if you want the email to
-       include the real file as an attachment instead of just a link.
+DELIVERY: after a customer pays, the bot sends them the Google Drive link
+in Messenger. That's it -- no file attachment, no bank-link fallbacks on
+the payment message. Keeping delivery to just a link keeps this simple and
+avoids Render bandwidth costs or Facebook's file-attachment quirks
+entirely. An OPTIONAL email step also exists (off by default): set
+ENABLE_EMAIL_DELIVERY=true to have the bot additionally ask for an email
+address and send the Drive link there via plain SMTP. By default the email
+does NOT attach the actual file -- attaching would mean downloading it
+onto Render first, using bandwidth and memory there. Set
+EMAIL_ATTACH_FILES=true (in addition to ENABLE_EMAIL_DELIVERY) if you want
+the email to include the real file as an attachment instead of just a
+link.
 
 WHY GOOGLE DRIVE, NO API NEEDED: each product's file just needs to be
 shared as "Anyone with the link can view" in Google Drive. You paste that
@@ -561,40 +555,6 @@ async def setup_messenger_profile() -> None:
         resp.raise_for_status()
 
 
-async def send_file_via_messenger(psid: str, product: Product) -> bool:
-    """Attempts to send the actual file as a Messenger attachment, by
-    pointing Meta at OUR OWN /files/{index} endpoint rather than Google
-    Drive's direct-download link directly. This matters because Drive
-    often serves a "can't scan for viruses" confirmation page instead of
-    the actual file for many files now, which Facebook can't parse as a
-    valid attachment (surfaces as error code 2018007, "Upload failed").
-    Our /files endpoint already knows how to get past that confirmation
-    step (see download_drive_file), so routing through it here means
-    Facebook always gets real file bytes with the correct content type.
-    NOTE: unlike fetching Drive directly, this does use Render bandwidth
-    once per delivery, since our server downloads the file from Drive and
-    Facebook then downloads it from us. Returns True if Meta accepted it,
-    False otherwise. Failure here is not fatal -- the Drive link is sent
-    separately regardless."""
-    if not product.drive_file_id:
-        return False
-    file_url = f"{CALLBACK_BASE_URL}/files/{product.index}"
-    try:
-        await send_meta_message(
-            {"id": psid},
-            {
-                "attachment": {
-                    "type": "file",
-                    "payload": {"url": file_url, "is_reusable": False},
-                }
-            },
-        )
-        return True
-    except Exception as e:
-        logger.warning("Failed to send file attachment via Messenger for psid=%s: %s", psid, e)
-        return False
-
-
 async def like_comment(comment_id: str) -> None:
     url = f"{GRAPH_API_BASE}/{comment_id}/likes"
     params = {"access_token": META_PAGE_ACCESS_TOKEN}
@@ -652,31 +612,6 @@ async def download_drive_file(file_id: str) -> bytes | None:
             return None
 
         return resp.content
-
-
-@app.get("/files/{product_index}")
-async def serve_product_file(product_index: int):
-    """Proxies a product's file through our own server instead of Google
-    Drive directly. This exists specifically so Facebook's Messenger Send
-    API can fetch a real file with a correct content type -- fetching
-    Drive's link directly often gets a "can't scan for viruses"
-    confirmation page instead of the file, which Facebook rejects with
-    error 2018007 ("Upload failed"). Trust level here matches the original
-    Drive link: anyone with this URL (or the product's Drive link) can
-    access the file, same as before."""
-    product = next((p for p in PRODUCTS if p.index == product_index), None)
-    if not product or not product.drive_file_id:
-        raise HTTPException(status_code=404, detail="Unknown product or no file configured")
-
-    file_bytes = await download_drive_file(product.drive_file_id)
-    if not file_bytes:
-        raise HTTPException(status_code=502, detail="Could not fetch file from Drive")
-
-    return Response(
-        content=file_bytes,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{product.filename}"'},
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -773,21 +708,12 @@ async def create_qpay_invoice(
         "qr_text": invoice.qr_text,
         "qr_image_base64": invoice.qr_image,
         "qpay_short_url": getattr(invoice, "qPay_shortUrl", None),
-        # Individual bank app deep links -- a fallback for when the
-        # short-URL redirect service is slow/unavailable (this has been
-        # observed on QPay's sandbox). Each entry has name/description/
-        # logo/link, one per supported bank app.
-        "bank_links": [
-            {"name": u.name, "link": u.link}
-            for u in getattr(invoice, "urls", [])
-        ],
     }
 
 
 async def deliver_digital_product(order_id: str) -> None:
-    """Called once QPay confirms payment. Sends the Drive link + attempts
-    a Messenger file attachment immediately, then asks for an email to
-    also send it there."""
+    """Called once QPay confirms payment. Sends the Drive link, then asks
+    for an email to also send it there (if enabled)."""
     record = INVOICES.get(order_id)
     if not record:
         return
@@ -802,8 +728,6 @@ async def deliver_digital_product(order_id: str) -> None:
     if product.drive_link:
         text += f"Татах холбоос: {product.drive_link}"
     await send_meta_message({"id": psid}, {"text": text})
-
-    await send_file_via_messenger(psid, product)
 
     if ENABLE_EMAIL_DELIVERY:
         # Ask for email so we can send a copy there too.
@@ -916,13 +840,6 @@ async def handle_messaging_event(event: dict) -> None:
             f"Хэрэв алдаа заасан тохиолдолд 1. Дэлгэцний буланд байрлах \u00b0\u00b0\u00b0 дарж "
             f"2. Open in external browser гэж дарна уу."
         )
-        bank_links = invoice.get("bank_links") or []
-        if bank_links:
-            # Fallback: individual bank app links, useful if the short URL
-            # above is slow to redirect (seen occasionally on QPay's
-            # sandbox). List a few so the customer has alternatives.
-            text += "\n\nЭсвэл дараах банкны холбоосоор шууд төлж болно:\n"
-            text += "\n".join(f"\u2022 {b['name']}: {b['link']}" for b in bank_links[:5])
         await send_meta_message({"id": sender_id}, {"text": text})
         return
 
@@ -1029,7 +946,6 @@ class CreateInvoiceResponse(BaseModel):
     qr_text: str
     qr_image_base64: str
     qpay_short_url: str | None = None
-    bank_links: list[dict] = []
 
 
 @app.post("/create-invoice", response_model=CreateInvoiceResponse)
