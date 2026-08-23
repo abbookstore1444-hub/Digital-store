@@ -44,6 +44,16 @@ Both show a scrollable carousel (Facebook's generic template, max 10
 items) with a "Buy" button per product, wired to the same QPay flow as
 the keyword-comment trigger.
 
+ORDER PERSISTENCE: orders are kept in memory for speed, but Render's free
+tier spins the server down after inactivity -- if that happens between a
+customer getting a payment link and actually paying, an in-memory-only
+order would be silently lost (paid, but never delivered). To prevent this,
+every order's recovery info (psid, product index, invoice ID) is also
+written to the Google Sheet at creation time, and the QPay callback falls
+back to reading it from there if memory doesn't have it. This safety net
+only works if GOOGLE_SHEETS_CREDENTIALS_JSON / GOOGLE_SHEET_ID are
+configured -- keep them set in production.
+
 Configure products via environment variables on Render:
 
     PRODUCT_1_KEYWORDS=no.1,no1
@@ -290,13 +300,38 @@ def get_orders_sheet():
     return client.open_by_key(GOOGLE_SHEET_ID).sheet1
 
 
-def log_new_order(order_id: str, amount: float, description: str, customer_name: str = "") -> None:
+# Sheet column layout (1-indexed, matches the order the header row should
+# use): order_id, customer_name, description, amount, status, timestamp,
+# email, psid, product_index, invoice_id.
+#
+# WHY THIS MATTERS BEYOND LOGGING: Render's free tier spins the server down
+# after inactivity. If that happens between a customer getting a payment
+# link and actually paying, the in-memory INVOICES dict (and AWAITING_EMAIL)
+# is wiped when the server wakes back up. Without a persistent copy, QPay's
+# payment confirmation would arrive to find no matching order -- the
+# customer would have paid real money and never receive their file, with no
+# error surfaced anywhere. Writing psid/product_index/invoice_id to the
+# Sheet at creation time, and reading them back if memory doesn't have the
+# order, closes that gap -- as long as Google Sheets is configured. If it
+# isn't configured, this fallback simply isn't available and the original
+# risk remains, so keep GOOGLE_SHEETS_CREDENTIALS_JSON / GOOGLE_SHEET_ID set
+# in production.
+_SHEET_COLUMNS = [
+    "order_id", "customer_name", "description", "amount", "status",
+    "timestamp", "email", "psid", "product_index", "invoice_id",
+]
+
+
+def log_new_order(
+    order_id: str, amount: float, description: str, customer_name: str,
+    psid: str, product_index: int, invoice_id: str,
+) -> None:
     sheet = get_orders_sheet()
     if not sheet:
         return
     sheet.append_row([
         order_id, customer_name, description, amount, "PENDING",
-        datetime.now(timezone.utc).isoformat(),
+        datetime.now(timezone.utc).isoformat(), "", psid, product_index, invoice_id,
     ])
 
 
@@ -312,16 +347,60 @@ def mark_order_paid(order_id: str) -> None:
 
 
 def update_order_email(order_id: str, email: str) -> None:
-    """Best-effort: adds the customer's email into a 6th column, if the
+    """Best-effort: adds the customer's email into the email column, if the
     sheet is configured and the order row can be found."""
     sheet = get_orders_sheet()
     if not sheet:
         return
     try:
         cell = sheet.find(order_id)
-        sheet.update_cell(cell.row, 6, email)
+        sheet.update_cell(cell.row, 7, email)
     except Exception:
         pass
+
+
+def get_order_from_sheet(order_id: str) -> dict | None:
+    """Reconstructs an order record from the Sheet, for when the in-memory
+    INVOICES dict was wiped by a server restart (e.g. Render free-tier
+    spin-down). Returns None if Sheets isn't configured, the order isn't
+    found, or the row is missing the fields needed to recover (e.g. very
+    old rows logged before this recovery feature existed)."""
+    sheet = get_orders_sheet()
+    if not sheet:
+        return None
+    try:
+        cell = sheet.find(order_id)
+        row = sheet.row_values(cell.row)
+    except Exception:
+        return None
+
+    # Pad the row in case older rows are shorter than the current schema.
+    row += [""] * (len(_SHEET_COLUMNS) - len(row))
+    data = dict(zip(_SHEET_COLUMNS, row))
+
+    psid = data.get("psid") or ""
+    invoice_id = data.get("invoice_id") or ""
+    product_index_raw = data.get("product_index") or ""
+    if not psid or not invoice_id or not product_index_raw:
+        logger.warning(
+            "Order %s found in sheet but missing recovery fields "
+            "(psid/invoice_id/product_index) -- likely logged before "
+            "persistence support was added.", order_id,
+        )
+        return None
+
+    try:
+        product_index = int(float(product_index_raw))
+    except ValueError:
+        return None
+
+    return {
+        "invoice_id": invoice_id,
+        "status": data.get("status") or "PENDING",
+        "psid": psid,
+        "product_index": product_index,
+        "email": data.get("email") or None,
+    }
 
 
 async def get_customer_name(psid: str) -> str:
@@ -625,13 +704,25 @@ async def create_qpay_invoice(
         "product_index": product_index,
         "email": None,
     }
-    log_new_order(order_id, amount, description, customer_name)
+    log_new_order(
+        order_id, amount, description, customer_name,
+        psid=psid or order_id, product_index=product_index or 0,
+        invoice_id=invoice.invoice_id,
+    )
 
     return {
         "invoice_id": invoice.invoice_id,
         "qr_text": invoice.qr_text,
         "qr_image_base64": invoice.qr_image,
         "qpay_short_url": getattr(invoice, "qPay_shortUrl", None),
+        # Individual bank app deep links -- a fallback for when the
+        # short-URL redirect service is slow/unavailable (this has been
+        # observed on QPay's sandbox). Each entry has name/description/
+        # logo/link, one per supported bank app.
+        "bank_links": [
+            {"name": u.name, "link": u.link}
+            for u in getattr(invoice, "urls", [])
+        ],
     }
 
 
@@ -761,10 +852,19 @@ async def handle_messaging_event(event: dict) -> None:
             customer_name=customer_name, psid=sender_id, product_index=product_index,
         )
         link = invoice.get("qpay_short_url") or invoice.get("qr_text")
-        await send_meta_message(
-            {"id": sender_id},
-            {"text": f"Qpay-ээр төлөх бол энд дарна уу: {link}\nХэрэв алдаа заасан тохиолдолд 1. Дэлгэцний буланд байрлах \u00b0\u00b0\u00b0 дарж 2. Open in external browser гэж дарна уу."},
+        text = (
+            f"Qpay-ээр төлөх бол энд дарна уу: {link}\n"
+            f"Хэрэв алдаа заасан тохиолдолд 1. Дэлгэцний буланд байрлах \u00b0\u00b0\u00b0 дарж "
+            f"2. Open in external browser гэж дарна уу."
         )
+        bank_links = invoice.get("bank_links") or []
+        if bank_links:
+            # Fallback: individual bank app links, useful if the short URL
+            # above is slow to redirect (seen occasionally on QPay's
+            # sandbox). List a few so the customer has alternatives.
+            text += "\n\nЭсвэл дараах банкны холбоосоор шууд төлж болно:\n"
+            text += "\n".join(f"\u2022 {b['name']}: {b['link']}" for b in bank_links[:5])
+        await send_meta_message({"id": sender_id}, {"text": text})
         return
 
     # Not a postback.
@@ -818,6 +918,20 @@ async def handle_messaging_event(event: dict) -> None:
 async def qpay_callback(order_id: str):
     record = INVOICES.get(order_id)
     if not record:
+        # Server may have restarted (e.g. Render free-tier spin-down) since
+        # this order was created, wiping the in-memory dict. Try to recover
+        # it from the Sheet before giving up -- this is what prevents a
+        # paid order from silently never being delivered.
+        record = get_order_from_sheet(order_id)
+        if record:
+            logger.info("Recovered order %s from Google Sheet after memory miss.", order_id)
+            INVOICES[order_id] = record
+    if not record:
+        logger.warning(
+            "qpay-callback for unknown order_id=%s -- not in memory and not "
+            "recoverable from Sheet (Sheets may be unconfigured, or this "
+            "order predates persistence support).", order_id,
+        )
         return "SUCCESS"
 
     settings = get_qpay_settings()
@@ -852,6 +966,7 @@ class CreateInvoiceResponse(BaseModel):
     qr_text: str
     qr_image_base64: str
     qpay_short_url: str | None = None
+    bank_links: list[dict] = []
 
 
 @app.post("/create-invoice", response_model=CreateInvoiceResponse)
