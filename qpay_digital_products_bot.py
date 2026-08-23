@@ -34,6 +34,19 @@ redirect). If a file is too large for either, delivery automatically falls
 back to just sending the link instead of the actual bytes -- nothing
 breaks, the customer just gets a link instead of an attachment.
 
+PAYMENT_MODE: choose how tapping "Buy" is handled --
+    - "qpay" (default): creates a real QPay invoice and sends the payment
+      link, as usual.
+    - "manual": sends CUSTOM_PAYMENT_TEXT instead (e.g. your own bank
+      transfer details), then waits for the customer to send a photo. As
+      soon as any image attachment arrives from them, the bot treats that
+      as payment proof and immediately delivers the Drive link -- no real
+      verification of the screenshot happens, so this mode is meant for
+      manual/trust-based selling, not automatic invoicing. Set with
+      PAYMENT_MODE=manual and customize the instructions via
+      CUSTOM_PAYMENT_TEXT (supports {amount} and {description}
+      placeholders).
+
 PRODUCT MENU: customers can browse all your products two ways --
     1. Persistent menu -- the hamburger icon inside the Messenger chat
        window, with a "View Products" item. Requires one manual setup
@@ -199,6 +212,33 @@ FALLBACK_REPLY_TEXT = os.environ.get(
     "таны бичсэнийг ойлгосонгүй.\n\n"
     "\U0001F6CD\uFE0F Бүтээгдэхүүн харахыг хүсвэл \"menu\" гэж бичнэ үү, "
     "эсвэл доорх цэсийг ашиглана уу.",
+)
+
+# --- Payment mode: "qpay" (default) or "manual" ---
+# "qpay": tapping Buy creates a real QPay invoice and sends the payment
+#   link, exactly as before.
+# "manual": tapping Buy instead sends CUSTOM_PAYMENT_TEXT (e.g. bank
+#   transfer details you write yourself) and waits for the customer to
+#   send a photo -- as soon as any image attachment arrives from them, the
+#   bot treats that as payment proof and immediately delivers the Drive
+#   link. There's no real verification of the screenshot's contents; this
+#   mode trusts that an image was sent as confirmation, which is why it's
+#   meant for manual/trust-based selling rather than automatic invoicing.
+PAYMENT_MODE = os.environ.get("PAYMENT_MODE", "qpay").strip().lower()
+
+# Sent instead of a QPay link when PAYMENT_MODE=manual. Use {amount} and
+# {description} as placeholders -- they'll be filled in per-product.
+CUSTOM_PAYMENT_TEXT = os.environ.get(
+    "CUSTOM_PAYMENT_TEXT",
+    "{description} -- {amount}\u20ae\n\n"
+    "Дараах дансанд шилжүүлээд, шилжүүлгийн зурган баримтаа энд илгээнэ үү:\n"
+    "[Банкны нэр, дансны дугаар, хүлээн авагчийн нэрээ энд бичнэ үү]",
+)
+# Sent if the customer replies with text (not a photo) while a manual
+# payment is pending, gently reminding them what's expected.
+AWAITING_SCREENSHOT_REMINDER_TEXT = os.environ.get(
+    "AWAITING_SCREENSHOT_REMINDER_TEXT",
+    "\U0001F4F8 Төлбөрийн баримтын зургаа энд илгээнэ үү.",
 )
 
 BUSINESS_NAME = os.environ.get("BUSINESS_NAME", "This business")
@@ -441,6 +481,9 @@ INVOICES: dict[str, dict] = {}
 # Tracks which PSIDs we're currently waiting on an email reply from, and
 # which order that email is for.
 AWAITING_EMAIL: dict[str, str] = {}
+# Tracks which PSIDs we're currently waiting on a payment screenshot from
+# (manual payment mode only), and which order it's for.
+AWAITING_PAYMENT_SCREENSHOT: dict[str, str] = {}
 
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -830,6 +873,27 @@ async def handle_messaging_event(event: dict) -> None:
         customer_name = await get_customer_name(sender_id)
         order_id = f"{sender_id}-{product_index}-{uuid.uuid4().hex[:6]}"
 
+        if PAYMENT_MODE == "manual":
+            # No QPay invoice -- just record a pending order and wait for
+            # the customer to send a screenshot as proof of payment.
+            INVOICES[order_id] = {
+                "invoice_id": "MANUAL",
+                "status": "PENDING",
+                "psid": sender_id,
+                "product_index": product_index,
+                "email": None,
+            }
+            log_new_order(
+                order_id, product.amount, product.description, customer_name,
+                psid=sender_id, product_index=product_index, invoice_id="MANUAL",
+            )
+            AWAITING_PAYMENT_SCREENSHOT[sender_id] = order_id
+            text = CUSTOM_PAYMENT_TEXT.replace(
+                "{amount}", f"{product.amount:.0f}"
+            ).replace("{description}", product.description)
+            await send_meta_message({"id": sender_id}, {"text": text})
+            return
+
         invoice = await create_qpay_invoice(
             order_id=order_id, amount=product.amount, description=product.description,
             customer_name=customer_name, psid=sender_id, product_index=product_index,
@@ -845,6 +909,24 @@ async def handle_messaging_event(event: dict) -> None:
 
     # Not a postback.
     message = event.get("message", {})
+
+    # Manual-payment mode: if we're waiting on a screenshot from this
+    # customer, check for an image attachment before looking at text at
+    # all (a photo message may have no text field).
+    if sender_id in AWAITING_PAYMENT_SCREENSHOT:
+        attachments = message.get("attachments") or []
+        if any(a.get("type") == "image" for a in attachments):
+            order_id = AWAITING_PAYMENT_SCREENSHOT.pop(sender_id)
+            record = INVOICES.get(order_id)
+            if record:
+                record["status"] = "PAID"
+                mark_order_paid(order_id)
+                await deliver_digital_product(order_id)
+            return
+        # Not a photo yet -- remind them and keep waiting.
+        await send_meta_message({"id": sender_id}, {"text": AWAITING_SCREENSHOT_REMINDER_TEXT})
+        return
+
     text = (message.get("text") or "").strip()
     if not text:
         return
