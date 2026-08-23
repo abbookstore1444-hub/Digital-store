@@ -8,9 +8,15 @@ Facebook Group invite or a video.
 
 DELIVERY: after a customer pays, they get the file via Messenger:
     1. A Google Drive link, sent immediately in Messenger.
-    2. The actual file, sent as a Messenger attachment (best-effort --
-       Facebook fetches it directly from Drive, so this costs Render
-       nothing regardless of file size).
+    2. The actual file, sent as a Messenger attachment. Facebook fetches it
+       from our own /files/{product_index} endpoint (not Drive directly),
+       which downloads it from Drive server-side first -- this uses a bit
+       of Render bandwidth/memory per delivery, capped by MAX_ATTACHMENT_MB.
+       This detour exists because Drive often serves a "can't scan for
+       viruses" confirmation page instead of the real file when fetched
+       programmatically, which Facebook can't use as an attachment
+       (error 2018007). Routing through our own server lets us handle that
+       confirmation step first, so Facebook always gets real file bytes.
     3. OPTIONAL email step (off by default): set ENABLE_EMAIL_DELIVERY=true
        to also have the bot ask for an email address and send the Drive
        link there via plain SMTP. By default the email does NOT attach the
@@ -104,7 +110,7 @@ import gspread
 import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse, PlainTextResponse, Response
 from google.oauth2.service_account import Credentials
 from pydantic import BaseModel
 
@@ -557,22 +563,29 @@ async def setup_messenger_profile() -> None:
 
 async def send_file_via_messenger(psid: str, product: Product) -> bool:
     """Attempts to send the actual file as a Messenger attachment, by
-    pointing Meta at the Drive direct-download link (Meta fetches it
-    server-side). Returns True if Meta accepted it, False otherwise (e.g.
-    file too large, or Drive served a confirmation page instead of the
-    file). Failure here is not fatal -- the Drive link is sent separately
-    regardless."""
-    file_id = product.drive_file_id
-    if not file_id:
+    pointing Meta at OUR OWN /files/{index} endpoint rather than Google
+    Drive's direct-download link directly. This matters because Drive
+    often serves a "can't scan for viruses" confirmation page instead of
+    the actual file for many files now, which Facebook can't parse as a
+    valid attachment (surfaces as error code 2018007, "Upload failed").
+    Our /files endpoint already knows how to get past that confirmation
+    step (see download_drive_file), so routing through it here means
+    Facebook always gets real file bytes with the correct content type.
+    NOTE: unlike fetching Drive directly, this does use Render bandwidth
+    once per delivery, since our server downloads the file from Drive and
+    Facebook then downloads it from us. Returns True if Meta accepted it,
+    False otherwise. Failure here is not fatal -- the Drive link is sent
+    separately regardless."""
+    if not product.drive_file_id:
         return False
-    direct_link = build_drive_direct_link(file_id)
+    file_url = f"{CALLBACK_BASE_URL}/files/{product.index}"
     try:
         await send_meta_message(
             {"id": psid},
             {
                 "attachment": {
                     "type": "file",
-                    "payload": {"url": direct_link, "is_reusable": False},
+                    "payload": {"url": file_url, "is_reusable": False},
                 }
             },
         )
@@ -599,9 +612,11 @@ async def reply_to_comment(comment_id: str, message: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# GOOGLE DRIVE FILE DOWNLOAD (for email attachments) -- no API key needed,
+# GOOGLE DRIVE FILE DOWNLOAD -- used both by the /files proxy endpoint
+# (Messenger attachment delivery) and email attachments. No API key needed,
 # just fetches the public share link. Handles Drive's "can't scan this
-# file for viruses" confirmation-page redirect for larger files.
+# file for viruses" confirmation-page redirect, which many files hit now
+# regardless of size.
 # ---------------------------------------------------------------------------
 
 async def download_drive_file(file_id: str) -> bytes | None:
@@ -637,6 +652,31 @@ async def download_drive_file(file_id: str) -> bytes | None:
             return None
 
         return resp.content
+
+
+@app.get("/files/{product_index}")
+async def serve_product_file(product_index: int):
+    """Proxies a product's file through our own server instead of Google
+    Drive directly. This exists specifically so Facebook's Messenger Send
+    API can fetch a real file with a correct content type -- fetching
+    Drive's link directly often gets a "can't scan for viruses"
+    confirmation page instead of the file, which Facebook rejects with
+    error 2018007 ("Upload failed"). Trust level here matches the original
+    Drive link: anyone with this URL (or the product's Drive link) can
+    access the file, same as before."""
+    product = next((p for p in PRODUCTS if p.index == product_index), None)
+    if not product or not product.drive_file_id:
+        raise HTTPException(status_code=404, detail="Unknown product or no file configured")
+
+    file_bytes = await download_drive_file(product.drive_file_id)
+    if not file_bytes:
+        raise HTTPException(status_code=502, detail="Could not fetch file from Drive")
+
+    return Response(
+        content=file_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{product.filename}"'},
+    )
 
 
 # ---------------------------------------------------------------------------
