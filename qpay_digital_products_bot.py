@@ -828,6 +828,11 @@ async def handle_feed_change(value: dict) -> None:
 
     product = find_matching_product(comment_text)
     if not product:
+        if FALLBACK_REPLY_TEXT:
+            try:
+                await send_meta_message({"comment_id": comment_id}, {"text": FALLBACK_REPLY_TEXT})
+            except Exception as e:
+                logger.warning("Failed to send fallback private reply for comment %s: %s", comment_id, e)
         return
 
     try:
