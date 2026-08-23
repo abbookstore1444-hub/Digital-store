@@ -226,11 +226,18 @@ FALLBACK_REPLY_TEXT = os.environ.get(
 #   meant for manual/trust-based selling rather than automatic invoicing.
 PAYMENT_MODE = os.environ.get("PAYMENT_MODE", "qpay").strip().lower()
 
+# Sent as its own message right before CUSTOM_PAYMENT_TEXT, confirming
+# which product they're about to pay for. Use {description} and {amount}
+# as placeholders. Only used in manual payment mode.
+SELECTED_PRODUCT_TEXT = os.environ.get(
+    "SELECTED_PRODUCT_TEXT",
+    "\u2705 Сонгосон бүтээгдэхүүн: {description} -- {amount}\u20ae",
+)
+
 # Sent instead of a QPay link when PAYMENT_MODE=manual. Use {amount} and
 # {description} as placeholders -- they'll be filled in per-product.
 CUSTOM_PAYMENT_TEXT = os.environ.get(
     "CUSTOM_PAYMENT_TEXT",
-    "{description} -- {amount}\u20ae\n\n"
     "Дараах дансанд шилжүүлээд, шилжүүлгийн зурган баримтаа энд илгээнэ үү:\n"
     "[Банкны нэр, дансны дугаар, хүлээн авагчийн нэрээ энд бичнэ үү]",
 )
@@ -902,10 +909,17 @@ async def handle_messaging_event(event: dict) -> None:
                 psid=sender_id, product_index=product_index, invoice_id="MANUAL",
             )
             AWAITING_PAYMENT_SCREENSHOT[sender_id] = order_id
-            text = CUSTOM_PAYMENT_TEXT.replace(
-                "{amount}", f"{product.amount:.0f}"
+
+            amount_str = f"{product.amount:.0f}"
+            selected_text = SELECTED_PRODUCT_TEXT.replace(
+                "{amount}", amount_str
             ).replace("{description}", product.description)
-            await send_meta_message({"id": sender_id}, {"text": text})
+            payment_text = CUSTOM_PAYMENT_TEXT.replace(
+                "{amount}", amount_str
+            ).replace("{description}", product.description)
+
+            await send_meta_message({"id": sender_id}, {"text": selected_text})
+            await send_meta_message({"id": sender_id}, {"text": payment_text})
             return
 
         invoice = await create_qpay_invoice(
