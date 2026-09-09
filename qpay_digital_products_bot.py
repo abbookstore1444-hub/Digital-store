@@ -34,6 +34,21 @@ redirect). If a file is too large for either, delivery automatically falls
 back to just sending the link instead of the actual bytes -- nothing
 breaks, the customer just gets a link instead of an attachment.
 
+REPLY_DELAY_SECONDS: set this (e.g. "5") to make every outgoing message
+wait that many seconds before actually sending, so replies feel less
+instant/robotic. 0 (default) sends immediately. Webhook processing runs in
+the background specifically so this delay never risks Facebook re-sending
+the same event due to a slow response.
+
+TYPING_DEBOUNCE_SECONDS: default 3. If a customer sends multiple text
+messages in quick succession (e.g. "hi" then "menu" as two separate
+messages), the bot waits this many seconds after their LAST message before
+replying, so it responds once to everything they typed instead of once
+per message. Set to 0 to disable and reply to every message immediately.
+Only affects general text replies (menu/fallback/email-capture) -- photo
+messages (e.g. manual-mode payment screenshots) always get an immediate
+reply regardless of this setting.
+
 PAYMENT_MODE: choose how tapping "Buy" is handled --
     - "qpay" (default): creates a real QPay invoice and sends the payment
       link, as usual.
@@ -105,6 +120,7 @@ import logging
 import os
 import re
 import smtplib
+import asyncio
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -156,6 +172,24 @@ GRAPH_API_VERSION = "v25.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
 TEST_ENDPOINT_SECRET = os.environ.get("TEST_ENDPOINT_SECRET", "")
+
+# How many seconds to wait before actually sending each outgoing message.
+# Set to make replies feel less instant/robotic (e.g. "5" for a 5-second
+# delay). 0 (default) sends immediately. Applies to every message the bot
+# sends -- comment replies, Pay buttons, payment confirmations, the menu,
+# everything -- since they all go through send_meta_message.
+REPLY_DELAY_SECONDS = float(os.environ.get("REPLY_DELAY_SECONDS", "0"))
+
+# How many seconds to wait, after a customer's text message, for them to
+# possibly send another one before actually replying. If they send a
+# second message within that window, the timer resets and only ONE reply
+# covers everything they typed -- rather than replying separately to each
+# message (e.g. someone typing "hi" then "menu" as two quick messages
+# would otherwise get two replies). Set to 0 to disable and reply to every
+# message immediately, as before. Does not affect photo/attachment
+# handling (e.g. manual-mode payment screenshots), which always replies
+# immediately.
+TYPING_DEBOUNCE_SECONDS = float(os.environ.get("TYPING_DEBOUNCE_SECONDS", "3"))
 
 COMMENT_REPLY_TEXT = os.environ.get(
     "COMMENT_REPLY_TEXT",
@@ -513,6 +547,12 @@ AWAITING_PAYMENT_SCREENSHOT: dict[str, str] = {}
 # customer_name in orders, since the direct Graph API lookup often can't
 # get a name at all.
 COMMENTER_NAMES: dict[str, str] = {}
+# Text-message debounce state (see TYPING_DEBOUNCE_SECONDS): buffers a
+# customer's messages received within the debounce window, and tracks the
+# currently-scheduled "reply after the window closes" task per PSID so a
+# new message can cancel/reschedule it.
+PENDING_TEXT_BUFFER: dict[str, list[str]] = {}
+PENDING_TEXT_TASK: dict[str, asyncio.Task] = {}
 
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -533,6 +573,8 @@ def verify_meta_signature(raw_body: bytes, signature_header: str) -> None:
 
 
 async def send_meta_message(recipient: dict, message: dict) -> None:
+    if REPLY_DELAY_SECONDS > 0:
+        await asyncio.sleep(REPLY_DELAY_SECONDS)
     url = f"{GRAPH_API_BASE}/me/messages"
     params = {"access_token": META_PAGE_ACCESS_TOKEN}
     payload = {"recipient": recipient, "message": message, "messaging_type": "RESPONSE"}
@@ -829,14 +871,23 @@ async def receive_meta_webhook(request: Request):
     data = json.loads(raw_body)
     logger.info("Incoming webhook payload: %s", json.dumps(data))
 
+    # Process in the background and acknowledge Facebook immediately. This
+    # matters once REPLY_DELAY_SECONDS is used: if we waited for the delay
+    # before responding here, Facebook's servers could time out and RESEND
+    # the same event, causing duplicate replies. Returning right away and
+    # doing the (possibly delayed) work afterward avoids that.
+    asyncio.create_task(process_webhook_event(data))
+
+    return {"status": "ok"}
+
+
+async def process_webhook_event(data: dict) -> None:
     for entry in data.get("entry", []):
         for change in entry.get("changes", []):
             if change.get("field") == "feed":
                 await handle_feed_change(change.get("value", {}))
         for messaging_event in entry.get("messaging", []):
             await handle_messaging_event(messaging_event)
-
-    return {"status": "ok"}
 
 
 def find_matching_product(comment_text: str) -> Product | None:
@@ -993,13 +1044,57 @@ async def handle_messaging_event(event: dict) -> None:
     if not text:
         return
 
-    # If they're not mid-email-capture, check whether they just typed a
-    # menu trigger word (e.g. "menu", "цэс") -- if so, show the product
-    # carousel. Otherwise, send a friendly fallback instead of going
-    # silent, so the bot doesn't feel broken when someone just says "hi".
+    if TYPING_DEBOUNCE_SECONDS > 0:
+        await schedule_debounced_text(sender_id, text)
+    else:
+        await process_text_messages(sender_id, [text])
+
+
+async def schedule_debounced_text(sender_id: str, text: str) -> None:
+    """Buffers a text message and (re)starts the debounce timer for this
+    PSID. If they send another message before the timer fires, the old
+    timer is cancelled and a fresh one starts -- so the reply only goes
+    out once, after TYPING_DEBOUNCE_SECONDS of silence."""
+    PENDING_TEXT_BUFFER.setdefault(sender_id, []).append(text)
+
+    existing_task = PENDING_TEXT_TASK.get(sender_id)
+    if existing_task and not existing_task.done():
+        existing_task.cancel()
+
+    PENDING_TEXT_TASK[sender_id] = asyncio.create_task(_debounced_text_worker(sender_id))
+
+
+async def _debounced_text_worker(sender_id: str) -> None:
+    try:
+        await asyncio.sleep(TYPING_DEBOUNCE_SECONDS)
+    except asyncio.CancelledError:
+        # A newer message arrived and rescheduled us -- the new task will
+        # handle the reply, so this one just quietly stops.
+        return
+
+    texts = PENDING_TEXT_BUFFER.pop(sender_id, [])
+    PENDING_TEXT_TASK.pop(sender_id, None)
+    if texts:
+        await process_text_messages(sender_id, texts)
+
+
+async def process_text_messages(sender_id: str, texts: list[str]) -> None:
+    """Handles everything a customer typed during one debounce window (or
+    just a single message, if debouncing is disabled) as ONE reply. Menu
+    keyword matching checks all the messages combined, so "hi" followed by
+    "menu" as two quick messages still triggers the menu once; the email
+    step uses the most recent message, since that's the one actually
+    meant as their email address."""
+    combined_lower = " ".join(texts).lower()
+    last_text = texts[-1]
+
+    # If they're not mid-email-capture, check whether they typed a menu
+    # trigger word (e.g. "menu", "цэс") anywhere in this batch -- if so,
+    # show the product carousel. Otherwise, send a friendly fallback
+    # instead of going silent, so the bot doesn't feel broken when someone
+    # just says "hi".
     if sender_id not in AWAITING_EMAIL:
-        text_lower = text.lower()
-        if any(kw in text_lower for kw in MENU_TRIGGER_KEYWORDS):
+        if any(kw in combined_lower for kw in MENU_TRIGGER_KEYWORDS):
             await send_product_menu(sender_id)
         else:
             await send_meta_message({"id": sender_id}, {"text": FALLBACK_REPLY_TEXT})
@@ -1012,7 +1107,7 @@ async def handle_messaging_event(event: dict) -> None:
         del AWAITING_EMAIL[sender_id]
         return
 
-    if not EMAIL_REGEX.match(text):
+    if not EMAIL_REGEX.match(last_text):
         await send_meta_message({"id": sender_id}, {"text": EMAIL_INVALID_TEXT})
         return  # keep waiting -- don't clear AWAITING_EMAIL
 
@@ -1021,9 +1116,9 @@ async def handle_messaging_event(event: dict) -> None:
         del AWAITING_EMAIL[sender_id]
         return
 
-    sent = await send_product_email(text, product)
-    record["email"] = text
-    update_order_email(order_id, text)
+    sent = await send_product_email(last_text, product)
+    record["email"] = last_text
+    update_order_email(order_id, last_text)
     del AWAITING_EMAIL[sender_id]
 
     if sent:
