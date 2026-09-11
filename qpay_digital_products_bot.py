@@ -1024,11 +1024,21 @@ async def handle_messaging_event(event: dict) -> None:
     message = event.get("message", {})
 
     # Manual-payment mode: if we're waiting on a screenshot from this
-    # customer, check for an image attachment before looking at text at
-    # all (a photo message may have no text field).
+    # customer, check for a REAL image attachment before looking at text
+    # at all (a photo message may have no text field).
     if sender_id in AWAITING_PAYMENT_SCREENSHOT:
         attachments = message.get("attachments") or []
-        if any(a.get("type") == "image" for a in attachments):
+        # IMPORTANT: Messenger's "Like" (thumbs-up) quick button also
+        # sends an attachment with type "image" -- it's a sticker, not a
+        # real photo. Stickers include a sticker_id in their payload; a
+        # genuine uploaded photo does not. Without this check, tapping
+        # Like would be mistaken for a payment screenshot and the bot
+        # would deliver the product for free.
+        has_real_photo = any(
+            a.get("type") == "image" and not a.get("payload", {}).get("sticker_id")
+            for a in attachments
+        )
+        if has_real_photo:
             order_id = AWAITING_PAYMENT_SCREENSHOT.pop(sender_id)
             record = INVOICES.get(order_id)
             if record:
@@ -1036,7 +1046,7 @@ async def handle_messaging_event(event: dict) -> None:
                 mark_order_paid(order_id)
                 await deliver_digital_product(order_id)
             return
-        # Not a photo yet -- remind them and keep waiting.
+        # Not a real photo yet -- remind them and keep waiting.
         await send_meta_message({"id": sender_id}, {"text": AWAITING_SCREENSHOT_REMINDER_TEXT})
         return
 
