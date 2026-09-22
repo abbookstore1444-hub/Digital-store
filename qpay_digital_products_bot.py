@@ -49,6 +49,16 @@ Only affects general text replies (menu/fallback/email-capture) -- photo
 messages (e.g. manual-mode payment screenshots) always get an immediate
 reply regardless of this setting.
 
+NAME COLLECTION (ENABLE_NAME_COLLECTION, default true): a customer who
+comments on a Page post gets their public name recorded for free (Meta
+includes it on the comment itself). A customer who clicks straight into
+Messenger from an ad never comments, so there's no free source for their
+name -- the Graph API profile lookup is locked down for most apps and
+usually fails. To cover that gap, first-time chatters (on the "Get
+Started" event) are asked for their name once; their reply is cached the
+same way a commenter's name would be, so it's picked up automatically the
+next time an order is created for them and logged correctly to the Sheet.
+
 PAYMENT_MODE: choose how tapping "Buy" is handled --
     - "qpay" (default): creates a real QPay invoice and sends the payment
       link, as usual.
@@ -90,14 +100,23 @@ Configure products via environment variables on Render:
     PRODUCT_1_DESCRIPTION=My Ebook
     PRODUCT_1_DRIVE_LINK=https://drive.google.com/file/d/XXXXXXXXXXXX/view
     PRODUCT_1_FILENAME=my-ebook.pdf
+    PRODUCT_1_CATEGORY=Ном
 
     PRODUCT_2_KEYWORDS=no.2,no2
     PRODUCT_2_AMOUNT=20000
     PRODUCT_2_DESCRIPTION=Another Ebook
     PRODUCT_2_DRIVE_LINK=https://drive.google.com/file/d/YYYYYYYYYYYY/view
     PRODUCT_2_FILENAME=another-ebook.pdf
+    PRODUCT_2_CATEGORY=Ном
 
     ...no limit, just keep numbering with no gaps.
+
+PRODUCT_N_CATEGORY groups products so customers pick a category first
+(e.g. "Ном" for books vs "Гарын авлага" for guides) instead of seeing
+every product mixed into one carousel -- see send_category_menu. It's
+optional: defaults to "Ном", so existing setups need nothing added.
+Only products you want split into a separate category need this set.
+Keep category names short (~20 characters) -- they become button titles.
 
 Email sending uses plain SMTP (works with Gmail app passwords, SendGrid,
 Mailgun's SMTP endpoint, etc.) -- configure with:
@@ -226,9 +245,30 @@ WELCOME_TEXT = os.environ.get(
     "WELCOME_TEXT",
     "\U0001F44B Сайн байна уу! Манай дэлгүүрт тавтай морил.",
 )
+# Whether to ask a first-time chatter for their name. This matters most
+# for customers who click straight into Messenger from an ad -- unlike
+# customers who comment on a Page post (where Meta gives us their public
+# name for free), direct Messenger chats have no reliable way to get a
+# name, since the Graph API profile lookup is locked down for most apps.
+# Set to "false" to disable.
+ENABLE_NAME_COLLECTION = os.environ.get("ENABLE_NAME_COLLECTION", "true").lower() == "true"
+ASK_NAME_TEXT = os.environ.get(
+    "ASK_NAME_TEXT",
+    "\U0001F60A Танилцахын тулд нэрээ бичээд илгээнэ үү.",
+)
+NAME_THANKS_TEXT = os.environ.get(
+    "NAME_THANKS_TEXT",
+    "Баярлалаа! \U0001F60A",
+)
 MENU_INTRO_TEXT = os.environ.get(
     "MENU_INTRO_TEXT",
     "\U0001F6CD\uFE0F Манай бүтээгдэхүүнүүд:",
+)
+# Shown with the category buttons (see send_category_menu) whenever we
+# don't yet know which product line the customer wants.
+CATEGORY_PROMPT_TEXT = os.environ.get(
+    "CATEGORY_PROMPT_TEXT",
+    "\U0001F60A Юу сонирхож байна?",
 )
 NO_PRODUCTS_TEXT = os.environ.get(
     "NO_PRODUCTS_TEXT",
@@ -325,6 +365,7 @@ class Product:
     description: str
     drive_link: str = ""
     filename: str = "file.pdf"
+    category: str = "Ном"
 
     @property
     def payload(self) -> str:
@@ -359,7 +400,13 @@ def build_drive_direct_link(file_id: str) -> str:
 
 def load_products() -> list[Product]:
     """Reads PRODUCT_1_..., PRODUCT_2_..., etc. Stops at the first missing
-    number, so products must be numbered without gaps starting from 1."""
+    number, so products must be numbered without gaps starting from 1.
+
+    PRODUCT_N_CATEGORY groups products for the category-selection step
+    (see send_category_menu) -- defaults to "Ном" (Books) so existing
+    setups keep working unchanged; only new categories (e.g. a guide)
+    need this set explicitly. Keep category names short: they become
+    button titles, which Messenger truncates around 20 characters."""
     products: list[Product] = []
     i = 1
     while True:
@@ -371,12 +418,23 @@ def load_products() -> list[Product]:
         description = os.environ.get(f"PRODUCT_{i}_DESCRIPTION", f"Product {i}")
         drive_link = os.environ.get(f"PRODUCT_{i}_DRIVE_LINK", "")
         filename = os.environ.get(f"PRODUCT_{i}_FILENAME", f"product_{i}.pdf")
-        products.append(Product(i, keywords, amount, description, drive_link, filename))
+        category = os.environ.get(f"PRODUCT_{i}_CATEGORY", "Ном")
+        products.append(Product(i, keywords, amount, description, drive_link, filename, category))
         i += 1
     return products
 
 
 PRODUCTS = load_products()
+
+
+def get_categories() -> list[str]:
+    """Unique category names across all configured products, in the order
+    they first appear."""
+    seen: list[str] = []
+    for p in PRODUCTS:
+        if p.category not in seen:
+            seen.append(p.category)
+    return seen
 
 
 def get_qpay_settings() -> QPaySettings:
@@ -553,6 +611,11 @@ COMMENTER_NAMES: dict[str, str] = {}
 # new message can cancel/reschedule it.
 PENDING_TEXT_BUFFER: dict[str, list[str]] = {}
 PENDING_TEXT_TASK: dict[str, asyncio.Task] = {}
+# Tracks which PSIDs we're currently waiting on a name reply from (see
+# ENABLE_NAME_COLLECTION). Their reply gets stored straight into
+# COMMENTER_NAMES, so it's picked up automatically the next time an order
+# is created for them.
+AWAITING_NAME: set[str] = set()
 
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
@@ -602,14 +665,19 @@ async def send_pay_button(recipient: dict, product: Product) -> None:
     )
 
 
-async def send_product_menu(psid: str) -> None:
-    """Sends a scrollable carousel of every configured product, each with
-    its own 'Buy' button. This is what shows up when a customer taps the
-    persistent menu's 'View Products' item, or just types something like
-    'menu'. Facebook's generic template caps out at 10 elements -- if you
-    configure more than 10 products, only the first 10 appear here (the
-    keyword-comment flow still works for all of them regardless)."""
-    if not PRODUCTS:
+async def send_product_menu(psid: str, category: str | None = None) -> None:
+    """Sends a scrollable carousel of configured products, each with its
+    own 'Buy' button. If `category` is given, only products in that
+    category are shown -- this is how send_category_menu's buttons filter
+    down to a specific product line (e.g. just the Excel guide, or just
+    the books). With no category, every product is shown, which is only
+    used as a fallback when there's nothing meaningful to filter by (e.g.
+    only one category configured in total). Facebook's generic template
+    caps out at 10 elements -- if a category has more than 10 products,
+    only the first 10 appear here (the keyword-comment flow still works
+    for all of them regardless)."""
+    matching = [p for p in PRODUCTS if category is None or p.category == category]
+    if not matching:
         await send_meta_message({"id": psid}, {"text": NO_PRODUCTS_TEXT})
         return
 
@@ -623,7 +691,7 @@ async def send_product_menu(psid: str) -> None:
                 {"type": "postback", "title": BUY_BUTTON_TEXT, "payload": product.payload}
             ],
         }
-        for product in PRODUCTS[:10]
+        for product in matching[:10]
     ]
 
     await send_meta_message(
@@ -632,6 +700,37 @@ async def send_product_menu(psid: str) -> None:
             "attachment": {
                 "type": "template",
                 "payload": {"template_type": "generic", "elements": elements},
+            }
+        },
+    )
+
+
+async def send_category_menu(psid: str) -> None:
+    """Sent instead of the full product menu whenever we don't know what
+    the customer is looking for (Get Started, the persistent menu, typing
+    'menu', or any unrecognized message) -- shows up to 3 buttons, one per
+    configured category (e.g. Books vs Excel Guide), so the next carousel
+    they see only contains relevant products. If there's only one category
+    configured in total, there's nothing to choose between, so this skips
+    straight to the full product menu instead."""
+    categories = get_categories()
+    if len(categories) <= 1:
+        await send_product_menu(psid)
+        return
+
+    await send_meta_message(
+        {"id": psid},
+        {
+            "attachment": {
+                "type": "template",
+                "payload": {
+                    "template_type": "button",
+                    "text": CATEGORY_PROMPT_TEXT,
+                    "buttons": [
+                        {"type": "postback", "title": cat[:20], "payload": f"CATEGORY::{cat}"}
+                        for cat in categories[:3]
+                    ],
+                },
             }
         },
     )
@@ -928,9 +1027,9 @@ async def handle_feed_change(value: dict) -> None:
         # which is available once that private-reply thread exists.
         if commenter_id:
             try:
-                await send_product_menu(commenter_id)
+                await send_category_menu(commenter_id)
             except Exception as e:
-                logger.warning("Failed to send product menu to commenter %s: %s", commenter_id, e)
+                logger.warning("Failed to send category menu to commenter %s: %s", commenter_id, e)
         return
 
     try:
@@ -956,11 +1055,19 @@ async def handle_messaging_event(event: dict) -> None:
 
         if payload == "GET_STARTED":
             await send_meta_message({"id": sender_id}, {"text": WELCOME_TEXT})
-            await send_product_menu(sender_id)
+            await send_category_menu(sender_id)
+            if ENABLE_NAME_COLLECTION and sender_id not in COMMENTER_NAMES:
+                await send_meta_message({"id": sender_id}, {"text": ASK_NAME_TEXT})
+                AWAITING_NAME.add(sender_id)
             return
 
         if payload == "VIEW_PRODUCTS":
-            await send_product_menu(sender_id)
+            await send_category_menu(sender_id)
+            return
+
+        if payload.startswith("CATEGORY::"):
+            category = payload[len("CATEGORY::"):]
+            await send_product_menu(sender_id, category=category)
             return
 
         if not payload.startswith("QPAY_PAY_"):
@@ -1098,17 +1205,29 @@ async def process_text_messages(sender_id: str, texts: list[str]) -> None:
     combined_lower = " ".join(texts).lower()
     last_text = texts[-1]
 
+    # If we just asked for their name (see ENABLE_NAME_COLLECTION), treat
+    # this reply as their name -- UNLESS it looks like a menu command
+    # (e.g. they ignored the question and typed "menu" instead), in which
+    # case we drop the name request and fall through to normal handling
+    # rather than saving "menu" as someone's name.
+    if sender_id in AWAITING_NAME:
+        AWAITING_NAME.discard(sender_id)
+        if not any(kw in combined_lower for kw in MENU_TRIGGER_KEYWORDS):
+            COMMENTER_NAMES[sender_id] = last_text.strip()[:100]
+            await send_meta_message({"id": sender_id}, {"text": NAME_THANKS_TEXT})
+            return
+
     # If they're not mid-email-capture, check whether they typed a menu
     # trigger word (e.g. "menu", "цэс") anywhere in this batch -- if so,
-    # show the product carousel. Otherwise, send a friendly fallback
+    # show the category picker. Otherwise, send a friendly fallback
     # instead of going silent, so the bot doesn't feel broken when someone
     # just says "hi".
     if sender_id not in AWAITING_EMAIL:
         if any(kw in combined_lower for kw in MENU_TRIGGER_KEYWORDS):
-            await send_product_menu(sender_id)
+            await send_category_menu(sender_id)
         else:
             await send_meta_message({"id": sender_id}, {"text": FALLBACK_REPLY_TEXT})
-            await send_product_menu(sender_id)
+            await send_category_menu(sender_id)
         return
 
     order_id = AWAITING_EMAIL[sender_id]
@@ -1248,13 +1367,24 @@ async def setup_messenger_profile_endpoint(secret: str = ""):
 
 
 @app.post("/test-menu")
-async def test_menu(psid: str, secret: str = ""):
+async def test_menu(psid: str, category: str | None = None, secret: str = ""):
     """TEST-ONLY: sends the product menu carousel to a given PSID, so you
     can check it looks right without needing to type 'menu' in Messenger
-    yourself first."""
+    yourself first. Pass ?category=... to test one category's carousel
+    specifically (e.g. category=Ном); omitted, it shows every product."""
     if TEST_ENDPOINT_SECRET and secret != TEST_ENDPOINT_SECRET:
         raise HTTPException(status_code=403, detail="Invalid or missing secret")
-    await send_product_menu(psid)
+    await send_product_menu(psid, category=category)
+    return {"status": "sent"}
+
+
+@app.post("/test-category-menu")
+async def test_category_menu(psid: str, secret: str = ""):
+    """TEST-ONLY: sends the category-picker buttons to a given PSID, so
+    you can check the Books/Guide split looks right before going live."""
+    if TEST_ENDPOINT_SECRET and secret != TEST_ENDPOINT_SECRET:
+        raise HTTPException(status_code=403, detail="Invalid or missing secret")
+    await send_category_menu(psid)
     return {"status": "sent"}
 
 
