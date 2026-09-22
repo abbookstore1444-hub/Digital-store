@@ -229,6 +229,15 @@ EMAIL_INVALID_TEXT = os.environ.get(
     "EMAIL_INVALID_TEXT",
     "Уучлаарай, имэйл хаяг зөв бичигдээгүй байна. Дахин оролдоно уу.",
 )
+# Quick-reply button labels attached to the messages above, so a customer
+# who doesn't want to keep retrying always has a one-tap way out -- see
+# handle_messaging_event's early quick_reply check. Keep these short
+# (~20 characters): Messenger truncates longer quick-reply titles.
+SKIP_EMAIL_BUTTON_TEXT = os.environ.get("SKIP_EMAIL_BUTTON_TEXT", "\u23ED Алгасах")
+EMAIL_SKIPPED_TEXT = os.environ.get(
+    "EMAIL_SKIPPED_TEXT",
+    "Ойлголоо! Messenger-т илгээсэн холбоосоор файлаа аль хэдийн авсан байгаа.",
+)
 
 # --- Product menu settings ---
 # Words that trigger the product menu when a customer just types a message
@@ -320,6 +329,15 @@ CUSTOM_PAYMENT_TEXT = os.environ.get(
 AWAITING_SCREENSHOT_REMINDER_TEXT = os.environ.get(
     "AWAITING_SCREENSHOT_REMINDER_TEXT",
     "\U0001F4F8 Төлбөрийн баримтын зургаа энд илгээнэ үү.",
+)
+# Quick-reply labels on the reminder above -- a one-tap way out for a
+# customer who changed their mind, instead of only ever getting the same
+# reminder no matter what they type. See handle_messaging_event.
+CANCEL_ORDER_BUTTON_TEXT = os.environ.get("CANCEL_ORDER_BUTTON_TEXT", "\u274C Цуцлах")
+VIEW_MENU_BUTTON_TEXT = os.environ.get("VIEW_MENU_BUTTON_TEXT", "\U0001F4CB Цэс")
+ORDER_CANCELLED_TEXT = os.environ.get(
+    "ORDER_CANCELLED_TEXT",
+    "Захиалгыг цуцаллаа. Өөр бүтээгдэхүүн үзэхийг хүсвэл доороос сонгоно уу.",
 )
 
 BUSINESS_NAME = os.environ.get("BUSINESS_NAME", "This business")
@@ -503,6 +521,20 @@ def mark_order_paid(order_id: str) -> None:
         pass
 
 
+def mark_order_cancelled(order_id: str) -> None:
+    """Best-effort: marks a still-PENDING order CANCELLED in the sheet, so
+    a customer backing out via the Cancel quick reply doesn't leave a
+    permanently-dangling PENDING row with no resolution."""
+    sheet = get_orders_sheet()
+    if not sheet:
+        return
+    try:
+        cell = sheet.find(order_id)
+        sheet.update_cell(cell.row, 5, "CANCELLED")
+    except Exception:
+        pass
+
+
 def update_order_email(order_id: str, email: str) -> None:
     """Best-effort: adds the customer's email into the email column, if the
     sheet is configured and the order row can be found."""
@@ -645,6 +677,21 @@ async def send_meta_message(recipient: dict, message: dict) -> None:
         resp = await http_client.post(url, params=params, json=payload)
         logger.info("Meta Send API response: %s %s", resp.status_code, resp.text)
         resp.raise_for_status()
+
+
+def quick_reply(title: str, payload: str) -> dict:
+    return {"content_type": "text", "title": title[:20], "payload": payload}
+
+
+async def clear_awaiting_state(sender_id: str) -> str | None:
+    """Clears any pending screenshot/email wait for this customer (used
+    when they tap Cancel/Skip/Menu to escape one of those states). Returns
+    the cleared order_id, if there was a pending PAYMENT screenshot wait
+    (email-wait orders are already paid, so there's nothing to cancel
+    there -- just stop waiting for the email)."""
+    order_id = AWAITING_PAYMENT_SCREENSHOT.pop(sender_id, None)
+    AWAITING_EMAIL.pop(sender_id, None)
+    return order_id
 
 
 async def send_pay_button(recipient: dict, product: Product) -> None:
@@ -1130,6 +1177,28 @@ async def handle_messaging_event(event: dict) -> None:
     # Not a postback.
     message = event.get("message", {})
 
+    # Quick-reply taps arrive as a normal message with a quick_reply
+    # payload attached -- check for our escape-hatch payloads FIRST,
+    # before AWAITING_PAYMENT_SCREENSHOT/AWAITING_EMAIL get a chance to
+    # intercept this as "not a valid photo/email, remind them again".
+    # This guarantees Cancel/Skip/Menu always works, regardless of state.
+    qr_payload = message.get("quick_reply", {}).get("payload")
+    if qr_payload == "CANCEL_ORDER":
+        cancelled_order_id = await clear_awaiting_state(sender_id)
+        if cancelled_order_id:
+            mark_order_cancelled(cancelled_order_id)
+        await send_meta_message({"id": sender_id}, {"text": ORDER_CANCELLED_TEXT})
+        await send_category_menu(sender_id)
+        return
+    if qr_payload == "SKIP_EMAIL":
+        await clear_awaiting_state(sender_id)
+        await send_meta_message({"id": sender_id}, {"text": EMAIL_SKIPPED_TEXT})
+        return
+    if qr_payload == "VIEW_MENU":
+        await clear_awaiting_state(sender_id)
+        await send_category_menu(sender_id)
+        return
+
     # Manual-payment mode: if we're waiting on a screenshot from this
     # customer, check for a REAL image attachment before looking at text
     # at all (a photo message may have no text field).
@@ -1154,7 +1223,16 @@ async def handle_messaging_event(event: dict) -> None:
                 await deliver_digital_product(order_id)
             return
         # Not a real photo yet -- remind them and keep waiting.
-        await send_meta_message({"id": sender_id}, {"text": AWAITING_SCREENSHOT_REMINDER_TEXT})
+        await send_meta_message(
+            {"id": sender_id},
+            {
+                "text": AWAITING_SCREENSHOT_REMINDER_TEXT,
+                "quick_replies": [
+                    quick_reply(CANCEL_ORDER_BUTTON_TEXT, "CANCEL_ORDER"),
+                    quick_reply(VIEW_MENU_BUTTON_TEXT, "VIEW_MENU"),
+                ],
+            },
+        )
         return
 
     text = (message.get("text") or "").strip()
@@ -1237,7 +1315,13 @@ async def process_text_messages(sender_id: str, texts: list[str]) -> None:
         return
 
     if not EMAIL_REGEX.match(last_text):
-        await send_meta_message({"id": sender_id}, {"text": EMAIL_INVALID_TEXT})
+        await send_meta_message(
+            {"id": sender_id},
+            {
+                "text": EMAIL_INVALID_TEXT,
+                "quick_replies": [quick_reply(SKIP_EMAIL_BUTTON_TEXT, "SKIP_EMAIL")],
+            },
+        )
         return  # keep waiting -- don't clear AWAITING_EMAIL
 
     product = next((p for p in PRODUCTS if p.index == record.get("product_index")), None)
