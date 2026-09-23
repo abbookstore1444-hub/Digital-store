@@ -142,7 +142,7 @@ import smtplib
 import asyncio
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
@@ -334,7 +334,7 @@ AWAITING_SCREENSHOT_REMINDER_TEXT = os.environ.get(
 # customer who changed their mind, instead of only ever getting the same
 # reminder no matter what they type. See handle_messaging_event.
 CANCEL_ORDER_BUTTON_TEXT = os.environ.get("CANCEL_ORDER_BUTTON_TEXT", "\u274C Цуцлах")
-VIEW_MENU_BUTTON_TEXT = os.environ.get("VIEW_MENU_BUTTON_TEXT", "\U0001F4CB Цэс")
+VIEW_MENU_BUTTON_TEXT = os.environ.get("VIEW_MENU_BUTTON_TEXT", "Үндсэн цэсрүү буцах")
 ORDER_CANCELLED_TEXT = os.environ.get(
     "ORDER_CANCELLED_TEXT",
     "Захиалгыг цуцаллаа. Өөр бүтээгдэхүүн үзэхийг хүсвэл доороос сонгоно уу.",
@@ -590,6 +590,71 @@ def get_order_from_sheet(order_id: str) -> dict | None:
         "product_index": product_index,
         "email": data.get("email") or None,
     }
+
+
+async def fulfill_manual_order(order_id: str) -> None:
+    """Marks a manual-mode order PAID and delivers it. Looks in the
+    in-memory INVOICES dict first, falling back to reconstructing the
+    order from the Sheet if that entry was lost (e.g. a Render restart
+    wiped AWAITING_PAYMENT_SCREENSHOT but somehow not this) -- this is
+    the same defensive fallback find_pending_manual_order_by_psid's
+    caller relies on, just also covering the case where the awaiting-flag
+    itself survived but the order record didn't."""
+    record = INVOICES.get(order_id) or get_order_from_sheet(order_id)
+    if not record:
+        logger.warning(
+            "Got a payment screenshot for order_id=%s but couldn't find "
+            "the order in memory or the Sheet -- can't deliver.", order_id,
+        )
+        return
+    INVOICES[order_id] = record
+    record["status"] = "PAID"
+    mark_order_paid(order_id)
+    await deliver_digital_product(order_id)
+
+
+def find_pending_manual_order_by_psid(psid: str, max_age_hours: float = 6) -> str | None:
+    """Best-effort recovery for manual-payment orders: finds the most
+    recent still-PENDING manual order for this customer in the Sheet.
+
+    Why this exists: AWAITING_PAYMENT_SCREENSHOT is in-memory only. If
+    Render's free tier spins the service down between the customer
+    tapping Buy and them actually sending their payment screenshot (very
+    plausible -- they have to go make the transfer first), that flag is
+    wiped on restart. Without this recovery, the screenshot then arrives
+    to a bot that no longer knows it was expected: the photo has no text,
+    so it silently falls through with no reply at all, and the customer
+    is left having paid with nothing delivered.
+
+    Scoped to orders created within max_age_hours so a photo sent for an
+    unrelated reason long after an abandoned order can't accidentally
+    resurrect and fulfill it."""
+    sheet = get_orders_sheet()
+    if not sheet:
+        return None
+    try:
+        rows = sheet.get_all_values()
+    except Exception:
+        return None
+
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    for row in reversed(rows[1:]):  # skip header row; most recent orders are at the bottom
+        row = row + [""] * (len(_SHEET_COLUMNS) - len(row))
+        data = dict(zip(_SHEET_COLUMNS, row))
+        if data.get("psid") != psid:
+            continue
+        if data.get("status") != "PENDING":
+            continue
+        if data.get("invoice_id") != "MANUAL":
+            continue
+        try:
+            ts = datetime.fromisoformat(data.get("timestamp", ""))
+        except ValueError:
+            continue
+        if ts < cutoff:
+            continue
+        return data.get("order_id") or None
+    return None
 
 
 async def get_customer_name(psid: str) -> str:
@@ -1216,11 +1281,7 @@ async def handle_messaging_event(event: dict) -> None:
         )
         if has_real_photo:
             order_id = AWAITING_PAYMENT_SCREENSHOT.pop(sender_id)
-            record = INVOICES.get(order_id)
-            if record:
-                record["status"] = "PAID"
-                mark_order_paid(order_id)
-                await deliver_digital_product(order_id)
+            await fulfill_manual_order(order_id)
             return
         # Not a real photo yet -- remind them and keep waiting.
         await send_meta_message(
@@ -1233,6 +1294,33 @@ async def handle_messaging_event(event: dict) -> None:
                 ],
             },
         )
+        return
+
+    # Recovery: a photo arrived, but we have no in-memory record of
+    # expecting one. Most likely explanation -- Render's free tier spun
+    # the service down and restarted between the Buy tap and this photo
+    # arriving (the customer had to go make the transfer first), wiping
+    # AWAITING_PAYMENT_SCREENSHOT. Without this check, the photo would
+    # just silently fall through below (it has no text) and the customer
+    # would be left having paid with nothing delivered. Scoped to a
+    # recent PENDING manual order for this exact customer, so a random
+    # unrelated photo sent long after an abandoned order can't
+    # accidentally resurrect and fulfill it.
+    attachments = message.get("attachments") or []
+    has_real_photo = any(
+        a.get("type") == "image" and not a.get("payload", {}).get("sticker_id")
+        for a in attachments
+    )
+    if has_real_photo:
+        recovered_order_id = find_pending_manual_order_by_psid(sender_id)
+        if recovered_order_id:
+            logger.info(
+                "Recovered a manual order (%s) from the Sheet for psid=%s "
+                "-- in-memory AWAITING_PAYMENT_SCREENSHOT was lost, likely "
+                "a Render restart between Buy and the screenshot arriving.",
+                recovered_order_id, sender_id,
+            )
+            await fulfill_manual_order(recovered_order_id)
         return
 
     text = (message.get("text") or "").strip()
