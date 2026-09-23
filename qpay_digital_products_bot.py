@@ -309,13 +309,26 @@ FALLBACK_REPLY_TEXT = os.environ.get(
 #   meant for manual/trust-based selling rather than automatic invoicing.
 PAYMENT_MODE = os.environ.get("PAYMENT_MODE", "qpay").strip().lower()
 
-# Sent as its own message right before CUSTOM_PAYMENT_TEXT, confirming
-# which product they're about to pay for. Use {description} and {amount}
-# as placeholders. Only used in manual payment mode.
+# Sent as its own message right before the payment instructions (bank
+# details in manual mode, the QPay link in qpay mode), confirming which
+# product they're about to pay for. Use {description} and {amount} as
+# placeholders.
 SELECTED_PRODUCT_TEXT = os.environ.get(
     "SELECTED_PRODUCT_TEXT",
     "\u2705 Сонгосон бүтээгдэхүүн: {description} -- {amount}\u20ae",
 )
+
+
+def build_selected_text(product: "Product") -> str:
+    """Resolves the 'you selected X' confirmation for one product: uses
+    that product's own PRODUCT_N_SELECTED_TEXT if set, otherwise falls
+    back to the global SELECTED_PRODUCT_TEXT -- so most products can
+    share the default wording while specific ones (e.g. a guide vs a
+    book) get their own phrasing."""
+    template = product.selected_text or SELECTED_PRODUCT_TEXT
+    return template.replace("{amount}", f"{product.amount:.0f}").replace(
+        "{description}", product.description
+    )
 
 # Sent instead of a QPay link when PAYMENT_MODE=manual. Use {amount} and
 # {description} as placeholders -- they'll be filled in per-product.
@@ -384,6 +397,7 @@ class Product:
     drive_link: str = ""
     filename: str = "file.pdf"
     category: str = "Ном"
+    selected_text: str = ""
 
     @property
     def payload(self) -> str:
@@ -424,7 +438,14 @@ def load_products() -> list[Product]:
     (see send_category_menu) -- defaults to "Ном" (Books) so existing
     setups keep working unchanged; only new categories (e.g. a guide)
     need this set explicitly. Keep category names short: they become
-    button titles, which Messenger truncates around 20 characters."""
+    button titles, which Messenger truncates around 20 characters.
+
+    PRODUCT_N_SELECTED_TEXT overrides the global SELECTED_PRODUCT_TEXT
+    for that one product -- e.g. a book might say "\U0001F4DA Таны сонгосон
+    ном:" while a guide says "\U0001F4CA Таны сонгосон гарын авлага:", rather
+    than every product sharing identical wording. Use {description} and
+    {amount} as placeholders, same as the global version. Optional: leave
+    unset and that product just uses the global text."""
     products: list[Product] = []
     i = 1
     while True:
@@ -437,7 +458,8 @@ def load_products() -> list[Product]:
         drive_link = os.environ.get(f"PRODUCT_{i}_DRIVE_LINK", "")
         filename = os.environ.get(f"PRODUCT_{i}_FILENAME", f"product_{i}.pdf")
         category = os.environ.get(f"PRODUCT_{i}_CATEGORY", "Ном")
-        products.append(Product(i, keywords, amount, description, drive_link, filename, category))
+        selected_text = os.environ.get(f"PRODUCT_{i}_SELECTED_TEXT", "")
+        products.append(Product(i, keywords, amount, description, drive_link, filename, category, selected_text))
         i += 1
     return products
 
@@ -1215,9 +1237,7 @@ async def handle_messaging_event(event: dict) -> None:
             AWAITING_PAYMENT_SCREENSHOT[sender_id] = order_id
 
             amount_str = f"{product.amount:.0f}"
-            selected_text = SELECTED_PRODUCT_TEXT.replace(
-                "{amount}", amount_str
-            ).replace("{description}", product.description)
+            selected_text = build_selected_text(product)
             payment_text = CUSTOM_PAYMENT_TEXT.replace(
                 "{amount}", amount_str
             ).replace("{description}", product.description)
@@ -1230,12 +1250,14 @@ async def handle_messaging_event(event: dict) -> None:
             order_id=order_id, amount=product.amount, description=product.description,
             customer_name=customer_name, psid=sender_id, product_index=product_index,
         )
+        selected_text = build_selected_text(product)
         link = invoice.get("qpay_short_url") or invoice.get("qr_text")
         text = (
             f"Qpay-ээр төлөх бол энд дарна уу: {link}\n"
             f"Хэрэв алдаа заасан тохиолдолд 1. Дэлгэцний буланд байрлах \u00b0\u00b0\u00b0 дарж "
             f"2. Open in external browser гэж дарна уу."
         )
+        await send_meta_message({"id": sender_id}, {"text": selected_text})
         await send_meta_message({"id": sender_id}, {"text": text})
         return
 
