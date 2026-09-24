@@ -1327,6 +1327,22 @@ async def handle_messaging_event(event: dict) -> None:
         # conversation" (rather than silently dropping it) is what makes
         # sure ad clicks actually get a reply regardless of the exact
         # payload Meta sends.
+        #
+        # IMPORTANT: don't do this if the customer is already mid-flow
+        # (waiting on a payment screenshot or an email). A stray postback
+        # arriving mid-conversation -- which does happen, e.g. certain
+        # referral/re-open events -- would otherwise wipe out their
+        # in-progress order with a jarring "hello, here's our menu"
+        # reset. Silently ignoring an ambiguous stray postback is far
+        # safer than interrupting an active purchase.
+        if sender_id in AWAITING_PAYMENT_SCREENSHOT or sender_id in AWAITING_EMAIL:
+            logger.info(
+                "Ignored unrecognized postback %r for psid=%s -- they're "
+                "mid-flow (awaiting screenshot/email), so not resetting.",
+                payload, sender_id,
+            )
+            return
+
         await send_meta_message({"id": sender_id}, {"text": WELCOME_TEXT})
         await send_category_menu(sender_id)
         if ENABLE_NAME_COLLECTION and sender_id not in COMMENTER_NAMES:
