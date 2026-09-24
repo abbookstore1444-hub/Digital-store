@@ -210,6 +210,17 @@ REPLY_DELAY_SECONDS = float(os.environ.get("REPLY_DELAY_SECONDS", "0"))
 # immediately.
 TYPING_DEBOUNCE_SECONDS = float(os.environ.get("TYPING_DEBOUNCE_SECONDS", "3"))
 
+# How many hours a manual-mode order stays recoverable-by-photo after the
+# customer taps Buy (see find_pending_manual_order_by_psid). Needs to be
+# generous -- customers often say things like "I'll pay in the morning" --
+# but isn't unlimited: manual mode trusts ANY photo as proof of payment
+# with no real verification, so an unbounded window would mean a long-
+# abandoned, never-paid order could get accidentally auto-delivered for
+# free by a completely unrelated photo sent months later. 48 hours covers
+# an overnight-to-next-day payment (even across a weekend) while still
+# closing eventually.
+PENDING_ORDER_RECOVERY_HOURS = float(os.environ.get("PENDING_ORDER_RECOVERY_HOURS", "48"))
+
 COMMENT_REPLY_TEXT = os.environ.get(
     "COMMENT_REPLY_TEXT",
     "Танд мэдээллийг чатаар илгээлээ! \U0001F4E9",
@@ -660,7 +671,7 @@ async def fulfill_manual_order(order_id: str) -> None:
     await deliver_digital_product(order_id)
 
 
-def find_pending_manual_order_by_psid(psid: str, max_age_hours: float = 6) -> str | None:
+def find_pending_manual_order_by_psid(psid: str, max_age_hours: float = None) -> str | None:
     """Best-effort recovery for manual-payment orders: finds the most
     recent still-PENDING manual order for this customer in the Sheet.
 
@@ -673,9 +684,12 @@ def find_pending_manual_order_by_psid(psid: str, max_age_hours: float = 6) -> st
     so it silently falls through with no reply at all, and the customer
     is left having paid with nothing delivered.
 
-    Scoped to orders created within max_age_hours so a photo sent for an
-    unrelated reason long after an abandoned order can't accidentally
-    resurrect and fulfill it."""
+    Scoped to orders created within max_age_hours (defaults to
+    PENDING_ORDER_RECOVERY_HOURS) so a photo sent for an unrelated reason
+    long after an abandoned order can't accidentally resurrect and
+    fulfill it."""
+    if max_age_hours is None:
+        max_age_hours = PENDING_ORDER_RECOVERY_HOURS
     sheet = get_orders_sheet()
     if not sheet:
         return None
@@ -870,12 +884,23 @@ async def send_category_menu(psid: str) -> None:
     'menu', or any unrecognized message) -- shows up to 3 buttons, one per
     configured category (e.g. Books vs Excel Guide), so the next carousel
     they see only contains relevant products. If there's only one category
-    configured in total, there's nothing to choose between, so this skips
-    straight to the full product menu instead.
+    configured in total, there's nothing to choose between.
 
-    If DIRECT_BUY_PRODUCT_INDEX is set, this skips BOTH the category
-    picker and the product carousel, sending that one product's Buy
-    button directly -- see the config comment above for when to use this."""
+    Within that fallback: if the whole store is down to exactly ONE
+    product (e.g. a category got paused via DISABLED_CATEGORIES, leaving
+    only the Excel guide), this skips the carousel too and sends that
+    product's Buy button directly, WITH its selected-text confirmation --
+    no separate config needed, since there's nothing left to actually
+    choose between. If that one category still has multiple products,
+    the carousel makes sense again (something to actually browse), so
+    that's what's shown.
+
+    DIRECT_BUY_PRODUCT_INDEX is a separate, explicit override for when
+    you want ONE specific product pushed to the front even while OTHER
+    products/categories still exist (e.g. running an ad for just the
+    guide while books remain active elsewhere) -- see its config comment.
+    You don't need to set it just because you're down to one product;
+    the automatic behavior above already covers that case."""
     if DIRECT_BUY_PRODUCT_INDEX:
         try:
             target_index = int(DIRECT_BUY_PRODUCT_INDEX)
@@ -893,7 +918,10 @@ async def send_category_menu(psid: str) -> None:
 
     categories = get_categories()
     if len(categories) <= 1:
-        await send_product_menu(psid)
+        if len(PRODUCTS) == 1:
+            await send_pay_button({"id": psid}, PRODUCTS[0])
+        else:
+            await send_product_menu(psid)
         return
 
     await send_meta_message(
