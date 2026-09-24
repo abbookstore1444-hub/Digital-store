@@ -445,7 +445,17 @@ def load_products() -> list[Product]:
     ном:" while a guide says "\U0001F4CA Таны сонгосон гарын авлага:", rather
     than every product sharing identical wording. Use {description} and
     {amount} as placeholders, same as the global version. Optional: leave
-    unset and that product just uses the global text."""
+    unset and that product just uses the global text.
+
+    DISABLED_CATEGORIES: comma-separated category names to hide
+    temporarily -- e.g. "Ном" to pause book sales while keeping guides
+    running, without deleting or renumbering anything. Matched products
+    are excluded everywhere: the category picker, the product carousel,
+    AND comment-keyword matching (so a book keyword in a comment won't
+    sell it either while paused). Remove the value (or the whole
+    variable) to bring the category back -- nothing else needs to
+    change, and product numbering never has to shift.
+    """
     products: list[Product] = []
     i = 1
     while True:
@@ -461,6 +471,11 @@ def load_products() -> list[Product]:
         selected_text = os.environ.get(f"PRODUCT_{i}_SELECTED_TEXT", "")
         products.append(Product(i, keywords, amount, description, drive_link, filename, category, selected_text))
         i += 1
+
+    disabled = {c.strip() for c in os.environ.get("DISABLED_CATEGORIES", "").split(",") if c.strip()}
+    if disabled:
+        products = [p for p in products if p.category not in disabled]
+
     return products
 
 
@@ -1118,9 +1133,30 @@ async def process_webhook_event(data: dict) -> None:
     for entry in data.get("entry", []):
         for change in entry.get("changes", []):
             if change.get("field") == "feed":
-                await handle_feed_change(change.get("value", {}))
+                try:
+                    await handle_feed_change(change.get("value", {}))
+                except Exception:
+                    logger.exception("Unhandled error processing feed change: %s", change)
         for messaging_event in entry.get("messaging", []):
-            await handle_messaging_event(messaging_event)
+            try:
+                await handle_messaging_event(messaging_event)
+            except Exception:
+                # Without this, any unexpected bug here means the
+                # customer just gets silence -- no reply, and nothing
+                # anyone would notice without actively tailing logs. This
+                # guarantees the failure is at least loud in the logs
+                # (full event included, for debugging), and gives the
+                # customer *something* back rather than nothing.
+                logger.exception("Unhandled error processing messaging event: %s", messaging_event)
+                sender_id = messaging_event.get("sender", {}).get("id")
+                if sender_id:
+                    try:
+                        await send_meta_message(
+                            {"id": sender_id},
+                            {"text": "Уучлаарай, түр зуурын алдаа гарлаа. Дахин оролдоно уу."},
+                        )
+                    except Exception:
+                        pass
 
 
 def find_matching_product(comment_text: str) -> Product | None:
@@ -1187,14 +1223,6 @@ async def handle_messaging_event(event: dict) -> None:
     if postback:
         payload = postback.get("payload", "")
 
-        if payload == "GET_STARTED":
-            await send_meta_message({"id": sender_id}, {"text": WELCOME_TEXT})
-            await send_category_menu(sender_id)
-            if ENABLE_NAME_COLLECTION and sender_id not in COMMENTER_NAMES:
-                await send_meta_message({"id": sender_id}, {"text": ASK_NAME_TEXT})
-                AWAITING_NAME.add(sender_id)
-            return
-
         if payload == "VIEW_PRODUCTS":
             await send_category_menu(sender_id)
             return
@@ -1204,61 +1232,77 @@ async def handle_messaging_event(event: dict) -> None:
             await send_product_menu(sender_id, category=category)
             return
 
-        if not payload.startswith("QPAY_PAY_"):
-            return
-        try:
-            product_index = int(payload.replace("QPAY_PAY_", "", 1))
-        except ValueError:
-            return
-        product = next((p for p in PRODUCTS if p.index == product_index), None)
-        if not product:
-            return
+        if payload.startswith("QPAY_PAY_"):
+            try:
+                product_index = int(payload.replace("QPAY_PAY_", "", 1))
+            except ValueError:
+                return
+            product = next((p for p in PRODUCTS if p.index == product_index), None)
+            if not product:
+                return
 
-        # Prefer the name we already have from a public comment (reliable,
-        # no special permission needed) over the Graph API profile lookup,
-        # which is locked down for most apps and often returns nothing.
-        customer_name = COMMENTER_NAMES.get(sender_id) or await get_customer_name(sender_id)
-        order_id = f"{sender_id}-{product_index}-{uuid.uuid4().hex[:6]}"
+            # Prefer the name we already have from a public comment
+            # (reliable, no special permission needed) over the Graph API
+            # profile lookup, which is locked down for most apps and
+            # often returns nothing.
+            customer_name = COMMENTER_NAMES.get(sender_id) or await get_customer_name(sender_id)
+            order_id = f"{sender_id}-{product_index}-{uuid.uuid4().hex[:6]}"
 
-        if PAYMENT_MODE == "manual":
-            # No QPay invoice -- just record a pending order and wait for
-            # the customer to send a screenshot as proof of payment.
-            INVOICES[order_id] = {
-                "invoice_id": "MANUAL",
-                "status": "PENDING",
-                "psid": sender_id,
-                "product_index": product_index,
-                "email": None,
-            }
-            log_new_order(
-                order_id, product.amount, product.description, customer_name,
-                psid=sender_id, product_index=product_index, invoice_id="MANUAL",
+            if PAYMENT_MODE == "manual":
+                # No QPay invoice -- just record a pending order and wait
+                # for the customer to send a screenshot as proof of payment.
+                INVOICES[order_id] = {
+                    "invoice_id": "MANUAL",
+                    "status": "PENDING",
+                    "psid": sender_id,
+                    "product_index": product_index,
+                    "email": None,
+                }
+                log_new_order(
+                    order_id, product.amount, product.description, customer_name,
+                    psid=sender_id, product_index=product_index, invoice_id="MANUAL",
+                )
+                AWAITING_PAYMENT_SCREENSHOT[sender_id] = order_id
+
+                amount_str = f"{product.amount:.0f}"
+                selected_text = build_selected_text(product)
+                payment_text = CUSTOM_PAYMENT_TEXT.replace(
+                    "{amount}", amount_str
+                ).replace("{description}", product.description)
+
+                await send_meta_message({"id": sender_id}, {"text": selected_text})
+                await send_meta_message({"id": sender_id}, {"text": payment_text})
+                return
+
+            invoice = await create_qpay_invoice(
+                order_id=order_id, amount=product.amount, description=product.description,
+                customer_name=customer_name, psid=sender_id, product_index=product_index,
             )
-            AWAITING_PAYMENT_SCREENSHOT[sender_id] = order_id
-
-            amount_str = f"{product.amount:.0f}"
             selected_text = build_selected_text(product)
-            payment_text = CUSTOM_PAYMENT_TEXT.replace(
-                "{amount}", amount_str
-            ).replace("{description}", product.description)
-
+            link = invoice.get("qpay_short_url") or invoice.get("qr_text")
+            text = (
+                f"Qpay-ээр төлөх бол энд дарна уу: {link}\n"
+                f"Хэрэв алдаа заасан тохиолдолд 1. Дэлгэцний буланд байрлах \u00b0\u00b0\u00b0 дарж "
+                f"2. Open in external browser гэж дарна уу."
+            )
             await send_meta_message({"id": sender_id}, {"text": selected_text})
-            await send_meta_message({"id": sender_id}, {"text": payment_text})
+            await send_meta_message({"id": sender_id}, {"text": text})
             return
 
-        invoice = await create_qpay_invoice(
-            order_id=order_id, amount=product.amount, description=product.description,
-            customer_name=customer_name, psid=sender_id, product_index=product_index,
-        )
-        selected_text = build_selected_text(product)
-        link = invoice.get("qpay_short_url") or invoice.get("qr_text")
-        text = (
-            f"Qpay-ээр төлөх бол энд дарна уу: {link}\n"
-            f"Хэрэв алдаа заасан тохиолдолд 1. Дэлгэцний буланд байрлах \u00b0\u00b0\u00b0 дарж "
-            f"2. Open in external browser гэж дарна уу."
-        )
-        await send_meta_message({"id": sender_id}, {"text": selected_text})
-        await send_meta_message({"id": sender_id}, {"text": text})
+        # Anything else -- including the literal "GET_STARTED" payload,
+        # but ALSO whatever Meta happens to send for a Click-to-Messenger
+        # ad open. Ad-driven opens don't reliably arrive with payload
+        # exactly equal to "GET_STARTED" -- it can be empty, a custom
+        # string set in Ads Manager, or just carry a referral object.
+        # Treating every unrecognized postback as "start the
+        # conversation" (rather than silently dropping it) is what makes
+        # sure ad clicks actually get a reply regardless of the exact
+        # payload Meta sends.
+        await send_meta_message({"id": sender_id}, {"text": WELCOME_TEXT})
+        await send_category_menu(sender_id)
+        if ENABLE_NAME_COLLECTION and sender_id not in COMMENTER_NAMES:
+            await send_meta_message({"id": sender_id}, {"text": ASK_NAME_TEXT})
+            AWAITING_NAME.add(sender_id)
         return
 
     # Not a postback.
