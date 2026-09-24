@@ -140,6 +140,7 @@ import os
 import re
 import smtplib
 import asyncio
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -775,6 +776,49 @@ PENDING_TEXT_TASK: dict[str, asyncio.Task] = {}
 # is created for them.
 AWAITING_NAME: set[str] = set()
 
+# Facebook's Messenger platform can (and sometimes does) deliver the same
+# webhook event more than once -- it's a documented at-least-once
+# delivery guarantee, not a bug on Meta's end. Without deduplication,
+# a single customer action (a comment, a button tap) can trigger two
+# separate replies, e.g. the whole "hello + category picker" sequence
+# showing up twice in a row. Tracks recently-seen event identifiers so a
+# repeat delivery is recognized and skipped; entries are pruned after
+# EVENT_DEDUP_WINDOW_SECONDS since duplicates only ever arrive within
+# seconds of the original, never after a long gap.
+PROCESSED_EVENT_IDS: dict[str, float] = {}
+EVENT_DEDUP_WINDOW_SECONDS = 300
+
+
+def is_duplicate_event(event: dict) -> bool:
+    """Returns True (and records it as seen) if this exact event was
+    already processed recently. Uses the message's own unique ID (mid)
+    when there is one; postbacks don't have a mid, so those are
+    identified by sender + timestamp + payload instead -- a genuine
+    second click by the same person would have a different timestamp,
+    while a duplicate delivery of the same click has an identical one."""
+    message = event.get("message") or {}
+    mid = message.get("mid")
+    if mid:
+        key = f"mid:{mid}"
+    else:
+        sender_id = event.get("sender", {}).get("id", "")
+        timestamp = event.get("timestamp", "")
+        postback_payload = (event.get("postback") or {}).get("payload", "")
+        key = f"pb:{sender_id}:{timestamp}:{postback_payload}"
+
+    now = time.time()
+    # Opportunistic cleanup so this dict doesn't grow forever.
+    if len(PROCESSED_EVENT_IDS) > 2000:
+        cutoff = now - EVENT_DEDUP_WINDOW_SECONDS
+        for k in [k for k, seen_at in PROCESSED_EVENT_IDS.items() if seen_at < cutoff]:
+            del PROCESSED_EVENT_IDS[k]
+
+    if key in PROCESSED_EVENT_IDS:
+        return True
+    PROCESSED_EVENT_IDS[key] = now
+    return False
+
+
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
@@ -1232,6 +1276,15 @@ async def handle_feed_change(value: dict) -> None:
     if not comment_id:
         return
 
+    # Same at-least-once delivery risk as messaging events -- see
+    # is_duplicate_event. Comments already have a stable, unique ID, so
+    # dedup here is even simpler.
+    dedup_key = f"comment:{comment_id}"
+    if dedup_key in PROCESSED_EVENT_IDS:
+        logger.info("Skipped duplicate webhook delivery for comment_id=%s", comment_id)
+        return
+    PROCESSED_EVENT_IDS[dedup_key] = time.time()
+
     # Cache the commenter's public name -- Meta gives us this for free on
     # every comment, unlike the Graph API profile lookup used elsewhere,
     # which is locked down for most apps. Do this regardless of whether
@@ -1252,7 +1305,14 @@ async def handle_feed_change(value: dict) -> None:
         # The private reply above can only use comment_id ONCE (Meta's
         # limit) -- any further message needs the commenter's actual ID,
         # which is available once that private-reply thread exists.
-        if commenter_id:
+        #
+        # Skip the follow-up menu/Buy-button entirely if they're already
+        # mid-payment (waiting on a screenshot or email) -- an unrelated
+        # comment on some other post shouldn't interrupt an active
+        # purchase with a confusing "buy now" prompt for a DIFFERENT
+        # attempt. Their actual order state is untouched either way; this
+        # only controls whether we also nudge them toward a new one.
+        if commenter_id and commenter_id not in AWAITING_PAYMENT_SCREENSHOT and commenter_id not in AWAITING_EMAIL:
             try:
                 await send_category_menu(commenter_id)
             except Exception as e:
@@ -1274,6 +1334,10 @@ async def handle_feed_change(value: dict) -> None:
 async def handle_messaging_event(event: dict) -> None:
     sender_id = event.get("sender", {}).get("id")
     if not sender_id:
+        return
+
+    if is_duplicate_event(event):
+        logger.info("Skipped duplicate webhook delivery for sender=%s", sender_id)
         return
 
     postback = event.get("postback")
