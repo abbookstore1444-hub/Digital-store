@@ -279,6 +279,16 @@ CATEGORY_PROMPT_TEXT = os.environ.get(
     "CATEGORY_PROMPT_TEXT",
     "\U0001F60A Юу сонирхож байна?",
 )
+# Optional override: set to a PRODUCT_N index (e.g. "3") to skip the
+# category picker AND the product carousel entirely -- every place that
+# would normally show one of those (Get Started, the persistent menu,
+# typing "menu", any unrecognized message) instead sends that ONE
+# product's Buy button directly. Useful when running an ad campaign for
+# a single product and you don't want any extra taps between "customer
+# messages" and "customer sees the Buy button". Leave unset for normal
+# menu/category behavior. Unset it (or clear the value) to go back to
+# showing the full menu again -- nothing else needs to change.
+DIRECT_BUY_PRODUCT_INDEX = os.environ.get("DIRECT_BUY_PRODUCT_INDEX", "").strip()
 NO_PRODUCTS_TEXT = os.environ.get(
     "NO_PRODUCTS_TEXT",
     "Уучлаарай, одоогоор бүтээгдэхүүн тохируулагдаагүй байна.",
@@ -861,7 +871,26 @@ async def send_category_menu(psid: str) -> None:
     configured category (e.g. Books vs Excel Guide), so the next carousel
     they see only contains relevant products. If there's only one category
     configured in total, there's nothing to choose between, so this skips
-    straight to the full product menu instead."""
+    straight to the full product menu instead.
+
+    If DIRECT_BUY_PRODUCT_INDEX is set, this skips BOTH the category
+    picker and the product carousel, sending that one product's Buy
+    button directly -- see the config comment above for when to use this."""
+    if DIRECT_BUY_PRODUCT_INDEX:
+        try:
+            target_index = int(DIRECT_BUY_PRODUCT_INDEX)
+        except ValueError:
+            target_index = None
+        product = next((p for p in PRODUCTS if p.index == target_index), None)
+        if product:
+            await send_pay_button({"id": psid}, product)
+            return
+        logger.warning(
+            "DIRECT_BUY_PRODUCT_INDEX=%r doesn't match any configured "
+            "product -- falling back to the normal menu.",
+            DIRECT_BUY_PRODUCT_INDEX,
+        )
+
     categories = get_categories()
     if len(categories) <= 1:
         await send_product_menu(psid)
