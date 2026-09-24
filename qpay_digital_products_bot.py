@@ -814,7 +814,7 @@ async def send_pay_button(recipient: dict, product: Product) -> None:
                 "type": "template",
                 "payload": {
                     "template_type": "button",
-                    "text": f"{product.description} -- {product.amount:.0f}\u20ae",
+                    "text": build_selected_text(product),
                     "buttons": [
                         {"type": "postback", "title": BUY_BUTTON_TEXT, "payload": product.payload}
                     ],
