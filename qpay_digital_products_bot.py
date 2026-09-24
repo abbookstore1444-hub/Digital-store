@@ -1294,12 +1294,14 @@ async def handle_messaging_event(event: dict) -> None:
                 AWAITING_PAYMENT_SCREENSHOT[sender_id] = order_id
 
                 amount_str = f"{product.amount:.0f}"
-                selected_text = build_selected_text(product)
                 payment_text = CUSTOM_PAYMENT_TEXT.replace(
                     "{amount}", amount_str
                 ).replace("{description}", product.description)
 
-                await send_meta_message({"id": sender_id}, {"text": selected_text})
+                # Not sending the "selected product" confirmation here --
+                # it's already shown as part of the Buy button message
+                # itself (see send_pay_button). Repeating it here would
+                # just duplicate it right before the payment instructions.
                 await send_meta_message({"id": sender_id}, {"text": payment_text})
                 return
 
@@ -1307,14 +1309,12 @@ async def handle_messaging_event(event: dict) -> None:
                 order_id=order_id, amount=product.amount, description=product.description,
                 customer_name=customer_name, psid=sender_id, product_index=product_index,
             )
-            selected_text = build_selected_text(product)
             link = invoice.get("qpay_short_url") or invoice.get("qr_text")
             text = (
                 f"Qpay-ээр төлөх бол энд дарна уу: {link}\n"
                 f"Хэрэв алдаа заасан тохиолдолд 1. Дэлгэцний буланд байрлах \u00b0\u00b0\u00b0 дарж "
                 f"2. Open in external browser гэж дарна уу."
             )
-            await send_meta_message({"id": sender_id}, {"text": selected_text})
             await send_meta_message({"id": sender_id}, {"text": text})
             return
 
