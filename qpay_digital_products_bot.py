@@ -1486,17 +1486,18 @@ async def handle_messaging_event(event: dict) -> None:
             order_id = AWAITING_PAYMENT_SCREENSHOT.pop(sender_id)
             await fulfill_manual_order(order_id)
             return
-        # Not a real photo yet -- remind them and keep waiting.
-        await send_meta_message(
-            {"id": sender_id},
-            {
-                "text": AWAITING_SCREENSHOT_REMINDER_TEXT,
-                "quick_replies": [
-                    quick_reply(CANCEL_ORDER_BUTTON_TEXT, "CANCEL_ORDER"),
-                    quick_reply(VIEW_MENU_BUTTON_TEXT, "VIEW_MENU"),
-                ],
-            },
-        )
+        # Not a real photo yet -- remind them and keep waiting. No
+        # quick-reply escape hatch here right now (Cancel/Menu) -- with
+        # only one product active, there's nowhere else for them to go
+        # anyway. If you add more products later, or want a manual way
+        # to back out again, re-add:
+        #   "quick_replies": [
+        #       quick_reply(CANCEL_ORDER_BUTTON_TEXT, "CANCEL_ORDER"),
+        #       quick_reply(VIEW_MENU_BUTTON_TEXT, "VIEW_MENU"),
+        #   ],
+        # Both handlers already exist further down and don't need any
+        # other change to start working again.
+        await send_meta_message({"id": sender_id}, {"text": AWAITING_SCREENSHOT_REMINDER_TEXT})
         return
 
     # Recovery: a photo arrived, but we have no in-memory record of
