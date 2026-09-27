@@ -1296,6 +1296,19 @@ async def handle_feed_change(value: dict) -> None:
         COMMENTER_NAMES[commenter_id] = commenter_name
 
     product = find_matching_product(comment_text)
+
+    # Like + publicly reply to EVERY comment now, matched or not -- makes
+    # the Page look responsive and active to anyone browsing the post,
+    # not just to people who happened to type the right keyword.
+    try:
+        await like_comment(comment_id)
+    except Exception as e:
+        logger.warning("Failed to like comment %s: %s", comment_id, e)
+    try:
+        await reply_to_comment(comment_id, COMMENT_REPLY_TEXT)
+    except Exception as e:
+        logger.warning("Failed to reply to comment %s: %s", comment_id, e)
+
     if not product:
         if FALLBACK_REPLY_TEXT:
             try:
@@ -1318,15 +1331,6 @@ async def handle_feed_change(value: dict) -> None:
             except Exception as e:
                 logger.warning("Failed to send category menu to commenter %s: %s", commenter_id, e)
         return
-
-    try:
-        await like_comment(comment_id)
-    except Exception as e:
-        logger.warning("Failed to like comment %s: %s", comment_id, e)
-    try:
-        await reply_to_comment(comment_id, COMMENT_REPLY_TEXT)
-    except Exception as e:
-        logger.warning("Failed to reply to comment %s: %s", comment_id, e)
 
     await send_pay_button({"comment_id": comment_id}, product)
 
