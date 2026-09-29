@@ -819,6 +819,38 @@ def is_duplicate_event(event: dict) -> bool:
     return False
 
 
+# Hard safety net against any runaway reply loop, regardless of cause.
+# The page_id check in handle_feed_change should already prevent the bot
+# from replying to its own comments (the specific mechanism that caused
+# one comment to get ~300 identical replies), but this is a second,
+# independent layer: if comment replies are firing far faster than any
+# real burst of customer activity plausibly would, stop sending them
+# rather than let something we haven't anticipated spiral the same way.
+RECENT_COMMENT_REPLY_TIMES: list[float] = []
+COMMENT_REPLY_BURST_LIMIT = 15
+COMMENT_REPLY_BURST_WINDOW_SECONDS = 60
+
+
+def comment_reply_circuit_breaker_tripped() -> bool:
+    """Records this reply attempt and returns True if we've sent
+    unusually many comment replies in a short window -- a sign something
+    is looping rather than genuine organic traffic."""
+    now = time.time()
+    cutoff = now - COMMENT_REPLY_BURST_WINDOW_SECONDS
+    while RECENT_COMMENT_REPLY_TIMES and RECENT_COMMENT_REPLY_TIMES[0] < cutoff:
+        RECENT_COMMENT_REPLY_TIMES.pop(0)
+    RECENT_COMMENT_REPLY_TIMES.append(now)
+    if len(RECENT_COMMENT_REPLY_TIMES) > COMMENT_REPLY_BURST_LIMIT:
+        logger.critical(
+            "Comment-reply circuit breaker tripped: %d replies sent in "
+            "the last %ds. Pausing further comment replies -- this "
+            "usually means something is looping, not real traffic.",
+            len(RECENT_COMMENT_REPLY_TIMES), COMMENT_REPLY_BURST_WINDOW_SECONDS,
+        )
+        return True
+    return False
+
+
 EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 
@@ -1232,10 +1264,20 @@ async def receive_meta_webhook(request: Request):
 
 async def process_webhook_event(data: dict) -> None:
     for entry in data.get("entry", []):
+        # The Page's own ID, per Meta's webhook structure -- needed so
+        # handle_feed_change can recognize (and ignore) comments the Page
+        # itself posted, e.g. our own public replies. Without this, the
+        # bot's own reply_to_comment call creates a brand-new comment,
+        # which is itself a new webhook event, which the bot then
+        # processes as if a customer wrote it -- replying again, creating
+        # another comment, triggering another webhook... an unbounded
+        # feedback loop, with a genuinely different comment_id every time
+        # so the dedup check never catches it.
+        page_id = entry.get("id")
         for change in entry.get("changes", []):
             if change.get("field") == "feed":
                 try:
-                    await handle_feed_change(change.get("value", {}))
+                    await handle_feed_change(change.get("value", {}), page_id)
                 except Exception:
                     logger.exception("Unhandled error processing feed change: %s", change)
         for messaging_event in entry.get("messaging", []):
@@ -1267,13 +1309,25 @@ def find_matching_product(comment_text: str) -> Product | None:
     return None
 
 
-async def handle_feed_change(value: dict) -> None:
+async def handle_feed_change(value: dict, page_id: str | None = None) -> None:
     if value.get("item") != "comment" or value.get("verb") != "add":
         return
 
     comment_text = (value.get("message") or "").lower()
     comment_id = value.get("comment_id")
     if not comment_id:
+        return
+
+    from_field = value.get("from") or {}
+    commenter_id = from_field.get("id")
+    commenter_name = from_field.get("name")
+
+    # CRITICAL: ignore comments the Page itself posted (e.g. our own
+    # public reply from reply_to_comment below). Without this check, the
+    # bot would process its own reply as if a customer wrote it, reply to
+    # THAT, and spiral into an unbounded self-triggering loop -- this is
+    # the exact cause of one comment getting ~300 identical replies.
+    if page_id and commenter_id == page_id:
         return
 
     # Same at-least-once delivery risk as messaging events -- see
@@ -1289,9 +1343,6 @@ async def handle_feed_change(value: dict) -> None:
     # every comment, unlike the Graph API profile lookup used elsewhere,
     # which is locked down for most apps. Do this regardless of whether
     # the comment matches a product, so it's available if they buy later.
-    from_field = value.get("from") or {}
-    commenter_id = from_field.get("id")
-    commenter_name = from_field.get("name")
     if commenter_id and commenter_name:
         COMMENTER_NAMES[commenter_id] = commenter_name
 
@@ -1300,14 +1351,17 @@ async def handle_feed_change(value: dict) -> None:
     # Like + publicly reply to EVERY comment now, matched or not -- makes
     # the Page look responsive and active to anyone browsing the post,
     # not just to people who happened to type the right keyword.
-    try:
-        await like_comment(comment_id)
-    except Exception as e:
-        logger.warning("Failed to like comment %s: %s", comment_id, e)
-    try:
-        await reply_to_comment(comment_id, COMMENT_REPLY_TEXT)
-    except Exception as e:
-        logger.warning("Failed to reply to comment %s: %s", comment_id, e)
+    if comment_reply_circuit_breaker_tripped():
+        logger.warning("Skipped like/reply for comment %s -- circuit breaker active.", comment_id)
+    else:
+        try:
+            await like_comment(comment_id)
+        except Exception as e:
+            logger.warning("Failed to like comment %s: %s", comment_id, e)
+        try:
+            await reply_to_comment(comment_id, COMMENT_REPLY_TEXT)
+        except Exception as e:
+            logger.warning("Failed to reply to comment %s: %s", comment_id, e)
 
     if not product:
         if FALLBACK_REPLY_TEXT:
