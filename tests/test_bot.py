@@ -393,6 +393,7 @@ def test_question_during_payment_gets_a_gemini_answer(secrets_and_stubs, owner, 
     assert message["text"].startswith("Excel-ийн томъёо")
     assert [q["payload"] for q in message["quick_replies"]] == ["CANCEL_ORDER", "VIEW_MENU"]
     assert "waiting for a screenshot" in seen["prompt"] and "Test ebook" in seen["prompt"]
+    assert "цахим гарын авлага" in seen["prompt"] and "хэвлэмэл ном биш" in seen["prompt"]
     assert bot.AWAITING_PAYMENT_SCREENSHOT["555"] == ORDER and owner["menu"] == []
 
 

@@ -1522,15 +1522,16 @@ ANSWER_SCHEMA = {
 
 
 def shop_facts() -> str:
-    lines = [f"- №{p.index}: {p.description} -- {p.amount:.0f}₮ ({p.category})" for p in PRODUCTS]
+    lines = [f"- №{p.index}: {p.description} -- {p.amount:.0f}₮ (цахим файл)" for p in PRODUCTS]
     pay = (
         "дансанд шилжүүлээд баримтын зургаа энэ чатад илгээнэ"
         if PAYMENT_MODE == "manual" else "QPay-ээр төлнө"
     )
     facts = (
-        "Бүтээгдэхүүнүүд:\n" + "\n".join(lines or ["(одоогоор байхгүй)"])
+        "Бүтээгдэхүүнүүд (бүгд цахим файл -- хэвлэмэл ном биш, хүргэлт байхгүй):\n"
+        + "\n".join(lines or ["(одоогоор байхгүй)"])
         + f"\n\nХэрхэн авах вэ: цэснээс бүтээгдэхүүнээ сонгоод «{BUY_BUTTON_TEXT}» дарна, {pay}. "
-        "Төлбөр баталгаажмагц файлын Google Drive холбоос энэ чатад ирнэ."
+        "Төлбөр баталгаажмагц PDF болон Excel файлын Google Drive татах холбоос энэ чатад шууд ирнэ."
     )
     if SHOP_INFO_TEXT:
         facts += "\n\n" + SHOP_INFO_TEXT
@@ -1546,9 +1547,13 @@ async def gemini_reply(sender_id: str, text: str, situation: str = "", quick_rep
     if not GEMINI_API_KEY:
         return None
     prompt = (
-        f"You are the Messenger assistant of the online shop «{BUSINESS_NAME}», which sells digital "
-        "products (ebooks and guides, delivered as a Google Drive link). Reply in the customer's "
-        "language (usually Mongolian Cyrillic), friendly, in at most 3 short sentences.\n"
+        f"You are the Messenger assistant of the online shop «{BUSINESS_NAME}», which sells ONLY digital "
+        "files: цахим гарын авлага as PDF, plus Excel practice files, delivered as a Google Drive download "
+        "link in this chat. Nothing is printed or shipped. Reply in the customer's language (usually "
+        "Mongolian Cyrillic), friendly, in at most 3 short sentences.\n"
+        "Call the products «цахим гарын авлага» or «PDF файл», never «ном» on its own, so nobody thinks "
+        "they are buying a printed book. If asked about delivery, a printed copy or shipping, say it is a "
+        "digital file sent here as a download link right after payment.\n"
         "Use ONLY the shop facts below. Never invent products, prices, discounts, deadlines or promises.\n"
         "Set needs_owner=true, and say the shop owner will reply soon, if the facts don't answer the "
         "message, or it is a complaint, a refund, a problem with a payment or download, or personal.\n"
