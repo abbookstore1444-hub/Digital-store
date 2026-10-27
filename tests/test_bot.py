@@ -19,6 +19,8 @@ from fastapi.testclient import TestClient
 
 import qpay_digital_products_bot as bot
 
+# The fixture below stubs send_meta_message; keep the real one for the token test.
+SEND_META_MESSAGE = bot.send_meta_message
 client = TestClient(bot.app)
 APP_SECRET = "app-secret"
 ADMIN_SECRET = "admin-secret"
@@ -124,6 +126,25 @@ def test_manual_buy_shows_cancel_with_bank_details(secrets_and_stubs, monkeypatc
     _, message = secrets_and_stubs[-1]
     assert [q["payload"] for q in message.get("quick_replies", [])] == ["CANCEL_ORDER", "VIEW_MENU"]
     assert "557" in bot.AWAITING_PAYMENT_SCREENSHOT
+
+
+def test_page_token_sent_in_header_not_url(monkeypatch):
+    monkeypatch.setattr(bot, "META_PAGE_ACCESS_TOKEN", "tok123")
+    monkeypatch.setattr(bot, "REPLY_DELAY_SECONDS", 0)
+    seen = {}
+
+    def handler(request):
+        seen["url"] = str(request.url)
+        seen["auth"] = request.headers.get("authorization")
+        return bot.httpx.Response(400, json={"error": {"message": "bad"}})
+
+    real_client = bot.httpx.AsyncClient
+    monkeypatch.setattr(bot.httpx, "AsyncClient",
+                        lambda *a, **k: real_client(transport=bot.httpx.MockTransport(handler)))
+    with pytest.raises(bot.httpx.HTTPStatusError) as err:
+        asyncio.run(SEND_META_MESSAGE({"id": "1"}, {"text": "hi"}))
+    assert "tok123" not in seen["url"] and "tok123" not in str(err.value)
+    assert seen["auth"] == "Bearer tok123"
 
 
 def test_httpx_does_not_log_request_urls():

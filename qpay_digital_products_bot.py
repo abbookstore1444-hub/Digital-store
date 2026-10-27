@@ -163,8 +163,8 @@ from qpay_client.v2.schemas import (
 )
 
 logging.basicConfig(level=logging.INFO)
-# httpx logs every request URL at INFO, and Graph API URLs carry
-# ?access_token=... -- that put the Page access token in Render's logs.
+# httpx logs every request URL at INFO. The token is no longer in URLs
+# (see graph_headers), but request URLs still aren't worth the log noise.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("qpay_digital_bot")
@@ -184,6 +184,12 @@ META_PAGE_ACCESS_TOKEN = os.environ.get("META_PAGE_ACCESS_TOKEN", "")
 META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
 GRAPH_API_VERSION = "v25.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
+
+
+def graph_headers() -> dict:
+    """The Page token goes in a header, never in the URL: httpx error
+    messages (and their tracebacks in the logs) include the full URL."""
+    return {"Authorization": f"Bearer {META_PAGE_ACCESS_TOKEN}"}
 
 TEST_ENDPOINT_SECRET = os.environ.get("TEST_ENDPOINT_SECRET", "")
 
@@ -714,10 +720,10 @@ async def get_customer_name(psid: str) -> str:
     if not META_PAGE_ACCESS_TOKEN:
         return ""
     url = f"{GRAPH_API_BASE}/{psid}"
-    params = {"fields": "first_name,last_name", "access_token": META_PAGE_ACCESS_TOKEN}
+    params = {"fields": "first_name,last_name"}
     try:
         async with httpx.AsyncClient() as http_client:
-            resp = await http_client.get(url, params=params)
+            resp = await http_client.get(url, params=params, headers=graph_headers())
             data = resp.json()
 
         if "error" in data:
@@ -868,10 +874,9 @@ async def send_meta_message(recipient: dict, message: dict) -> None:
     if REPLY_DELAY_SECONDS > 0:
         await asyncio.sleep(REPLY_DELAY_SECONDS)
     url = f"{GRAPH_API_BASE}/me/messages"
-    params = {"access_token": META_PAGE_ACCESS_TOKEN}
     payload = {"recipient": recipient, "message": message, "messaging_type": "RESPONSE"}
     async with httpx.AsyncClient() as http_client:
-        resp = await http_client.post(url, params=params, json=payload)
+        resp = await http_client.post(url, headers=graph_headers(), json=payload)
         # Body only on errors: successful responses just echo IDs.
         if resp.is_error:
             logger.warning("Meta Send API error: %s %s", resp.status_code, resp.text)
@@ -1034,7 +1039,6 @@ async def setup_messenger_profile() -> None:
     POST /setup-messenger-profile once after deploying, and again anytime
     you add/remove products."""
     url = f"{GRAPH_API_BASE}/me/messenger_profile"
-    params = {"access_token": META_PAGE_ACCESS_TOKEN}
     payload = {
         "get_started": {"payload": "GET_STARTED"},
         "persistent_menu": [
@@ -1052,24 +1056,22 @@ async def setup_messenger_profile() -> None:
         ],
     }
     async with httpx.AsyncClient() as http_client:
-        resp = await http_client.post(url, params=params, json=payload)
+        resp = await http_client.post(url, headers=graph_headers(), json=payload)
         logger.info("Messenger profile setup response: %s %s", resp.status_code, resp.text)
         resp.raise_for_status()
 
 
 async def like_comment(comment_id: str) -> None:
     url = f"{GRAPH_API_BASE}/{comment_id}/likes"
-    params = {"access_token": META_PAGE_ACCESS_TOKEN}
     async with httpx.AsyncClient() as http_client:
-        resp = await http_client.post(url, params=params)
+        resp = await http_client.post(url, headers=graph_headers())
         resp.raise_for_status()
 
 
 async def reply_to_comment(comment_id: str, message: str) -> None:
     url = f"{GRAPH_API_BASE}/{comment_id}/comments"
-    params = {"access_token": META_PAGE_ACCESS_TOKEN}
     async with httpx.AsyncClient() as http_client:
-        resp = await http_client.post(url, params=params, json={"message": message})
+        resp = await http_client.post(url, headers=graph_headers(), json={"message": message})
         resp.raise_for_status()
 
 
