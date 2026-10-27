@@ -26,13 +26,11 @@ no OAuth. This keeps things simple, but does mean anyone who gets the link
 can access the file (same trade-off as the group-link approach in the
 original bot).
 
-CAVEAT ON LARGE FILES: Google Drive shows a "can't scan for viruses"
-confirmation page for files it can't quickly scan (common above ~25-100MB,
-depending on file type). This bot handles the small-file case (direct
-download works) and the confirm-token case (handles Drive's confirmation
-redirect). If a file is too large for either, delivery automatically falls
-back to just sending the link instead of the actual bytes -- nothing
-breaks, the customer just gets a link instead of an attachment.
+CAVEAT ON LARGE FILES (email attachments only): Google Drive shows a
+"can't scan for viruses" confirmation page for files it can't quickly scan
+(common above ~25-100MB). download_drive_file handles the direct-download
+and confirm-token cases; if neither works, or the file is over
+MAX_ATTACHMENT_MB, the email just includes the Drive link instead.
 
 REPLY_DELAY_SECONDS: set this (e.g. "5") to make every outgoing message
 wait that many seconds before actually sending, so replies feel less
@@ -152,8 +150,7 @@ from email.mime.text import MIMEText
 import gspread
 import httpx
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from google.oauth2.service_account import Credentials
 from pydantic import BaseModel
 
@@ -169,13 +166,6 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("qpay_digital_bot")
 
 app = FastAPI(title="QPay Digital Products Messenger Bot")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ---------------------------------------------------------------------------
 # CONFIGURATION -- all set as Environment Variables on Render.
@@ -391,17 +381,14 @@ SMTP_FROM_EMAIL = os.environ.get("SMTP_FROM_EMAIL", SMTP_USERNAME)
 SMTP_FROM_NAME = os.environ.get("SMTP_FROM_NAME", BUSINESS_NAME)
 
 # Master switch for the whole email step. When off, the bot never asks for
-# an email after payment, and just skips straight from delivery to done --
-# Messenger (link + file attachment) remains the only delivery channel.
-# Set to "true" to re-enable asking for email.
+# an email after payment -- the Drive link in Messenger is the only
+# delivery channel. Set to "true" to enable asking for email.
 ENABLE_EMAIL_DELIVERY = os.environ.get("ENABLE_EMAIL_DELIVERY", "false").lower() == "true"
 
 # Whether to actually download the file from Drive and attach it to the
 # email. Defaults to OFF -- emails just include the Drive link instead,
-# which costs zero Render bandwidth/memory. Set to "true" to attach the
-# real file to emails (Messenger delivery already sends the actual file
-# separately either way, at no cost to Render, since Facebook fetches it
-# directly from Drive). Has no effect if ENABLE_EMAIL_DELIVERY is off.
+# which costs zero Render bandwidth/memory. Has no effect if
+# ENABLE_EMAIL_DELIVERY is off.
 EMAIL_ATTACH_FILES = os.environ.get("EMAIL_ATTACH_FILES", "false").lower() == "true"
 
 # Max file size we'll try to download+attach to an email, if
@@ -859,8 +846,12 @@ EMAIL_REGEX = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 # ---------------------------------------------------------------------------
 
 def verify_meta_signature(raw_body: bytes, signature_header: str) -> None:
+    # Without the app secret anyone could post fake events (e.g. a fake
+    # payment photo in manual mode) and get products delivered for free,
+    # so unsigned webhooks are rejected rather than trusted.
     if not META_APP_SECRET:
-        return
+        logger.critical("META_APP_SECRET is not set -- rejecting webhook. Set it on Render.")
+        raise HTTPException(status_code=503, detail="Webhook verification not configured")
     if not signature_header or not signature_header.startswith("sha256="):
         raise HTTPException(status_code=403, detail="Missing signature")
     expected = hmac.new(META_APP_SECRET.encode("utf-8"), raw_body, hashlib.sha256).hexdigest()
@@ -877,7 +868,11 @@ async def send_meta_message(recipient: dict, message: dict) -> None:
     payload = {"recipient": recipient, "message": message, "messaging_type": "RESPONSE"}
     async with httpx.AsyncClient() as http_client:
         resp = await http_client.post(url, params=params, json=payload)
-        logger.info("Meta Send API response: %s %s", resp.status_code, resp.text)
+        # Body only on errors: successful responses just echo IDs.
+        if resp.is_error:
+            logger.warning("Meta Send API error: %s %s", resp.status_code, resp.text)
+        else:
+            logger.info("Meta Send API: %s", resp.status_code)
         resp.raise_for_status()
 
 
@@ -1067,11 +1062,10 @@ async def reply_to_comment(comment_id: str, message: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# GOOGLE DRIVE FILE DOWNLOAD -- used both by the /files proxy endpoint
-# (Messenger attachment delivery) and email attachments. No API key needed,
-# just fetches the public share link. Handles Drive's "can't scan this
-# file for viruses" confirmation-page redirect, which many files hit now
-# regardless of size.
+# GOOGLE DRIVE FILE DOWNLOAD -- used for email attachments
+# (EMAIL_ATTACH_FILES). No API key needed, just fetches the public share
+# link. Handles Drive's "can't scan this file for viruses" confirmation-page
+# redirect, which many files hit now regardless of size.
 # ---------------------------------------------------------------------------
 
 async def download_drive_file(file_id: str) -> bytes | None:
@@ -1155,7 +1149,6 @@ async def send_product_email(to_email: str, product: Product) -> bool:
         body += f"\nDrive-с татах холбоос: {product.drive_link}\n"
 
     try:
-        import asyncio
         await asyncio.to_thread(
             _send_email_sync, to_email, product.description, body, attachment
         )
@@ -1244,13 +1237,40 @@ async def verify_meta_webhook(request: Request):
 # ---------------------------------------------------------------------------
 # 2) META WEBHOOK EVENTS (comments + button clicks + email replies)
 # ---------------------------------------------------------------------------
+def summarize_webhook(data: dict) -> str:
+    """One log-friendly line per event (type + sender ID), with no message
+    text, names or attachment URLs."""
+    parts = []
+    for entry in data.get("entry", []):
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+            parts.append(f"{change.get('field')}:{value.get('item')}/{value.get('verb')} comment={value.get('comment_id')}")
+        for event in entry.get("messaging", []):
+            sender = event.get("sender", {}).get("id")
+            if event.get("postback"):
+                kind = f"postback({event['postback'].get('payload', '')})"
+            elif event.get("message"):
+                msg = event["message"]
+                if msg.get("quick_reply"):
+                    kind = f"quick_reply({msg['quick_reply'].get('payload')})"
+                elif msg.get("attachments"):
+                    kind = "attachments(" + ",".join(a.get("type", "?") for a in msg["attachments"]) + ")"
+                else:
+                    kind = "text"
+            else:
+                kind = "other"
+            parts.append(f"messaging:{kind} sender={sender}")
+    return "; ".join(parts) or f"object={data.get('object')} (no events)"
+
+
 @app.post("/meta-webhook")
 async def receive_meta_webhook(request: Request):
     raw_body = await request.body()
     verify_meta_signature(raw_body, request.headers.get("X-Hub-Signature-256", ""))
 
     data = json.loads(raw_body)
-    logger.info("Incoming webhook payload: %s", json.dumps(data))
+    # Summary only -- the full payload holds customers' names and messages.
+    logger.info("Incoming webhook: %s", summarize_webhook(data))
 
     # Process in the background and acknowledge Facebook immediately. This
     # matters once REPLY_DELAY_SECONDS is used: if we waited for the delay
@@ -1279,7 +1299,10 @@ async def process_webhook_event(data: dict) -> None:
                 try:
                     await handle_feed_change(change.get("value", {}), page_id)
                 except Exception:
-                    logger.exception("Unhandled error processing feed change: %s", change)
+                    logger.exception(
+                    "Unhandled error processing feed change (comment_id=%s)",
+                    change.get("value", {}).get("comment_id"),
+                )
         for messaging_event in entry.get("messaging", []):
             try:
                 await handle_messaging_event(messaging_event)
@@ -1287,10 +1310,12 @@ async def process_webhook_event(data: dict) -> None:
                 # Without this, any unexpected bug here means the
                 # customer just gets silence -- no reply, and nothing
                 # anyone would notice without actively tailing logs. This
-                # guarantees the failure is at least loud in the logs
-                # (full event included, for debugging), and gives the
-                # customer *something* back rather than nothing.
-                logger.exception("Unhandled error processing messaging event: %s", messaging_event)
+                # guarantees the failure is at least loud in the logs, and
+                # gives the customer *something* back rather than nothing.
+                logger.exception(
+                    "Unhandled error processing messaging event: %s",
+                    summarize_webhook({"entry": [{"messaging": [messaging_event]}]}),
+                )
                 sender_id = messaging_event.get("sender", {}).get("id")
                 if sender_id:
                     try:
@@ -1544,18 +1569,19 @@ async def handle_messaging_event(event: dict) -> None:
             order_id = AWAITING_PAYMENT_SCREENSHOT.pop(sender_id)
             await fulfill_manual_order(order_id)
             return
-        # Not a real photo yet -- remind them and keep waiting. No
-        # quick-reply escape hatch here right now (Cancel/Menu) -- with
-        # only one product active, there's nowhere else for them to go
-        # anyway. If you add more products later, or want a manual way
-        # to back out again, re-add:
-        #   "quick_replies": [
-        #       quick_reply(CANCEL_ORDER_BUTTON_TEXT, "CANCEL_ORDER"),
-        #       quick_reply(VIEW_MENU_BUTTON_TEXT, "VIEW_MENU"),
-        #   ],
-        # Both handlers already exist further down and don't need any
-        # other change to start working again.
-        await send_meta_message({"id": sender_id}, {"text": AWAITING_SCREENSHOT_REMINDER_TEXT})
+        # Not a real photo yet -- remind them and keep waiting, with a
+        # one-tap way out (handled by the quick_reply checks above) so a
+        # customer who changed their mind isn't stuck in this state.
+        await send_meta_message(
+            {"id": sender_id},
+            {
+                "text": AWAITING_SCREENSHOT_REMINDER_TEXT,
+                "quick_replies": [
+                    quick_reply(CANCEL_ORDER_BUTTON_TEXT, "CANCEL_ORDER"),
+                    quick_reply(VIEW_MENU_BUTTON_TEXT, "VIEW_MENU"),
+                ],
+            },
+        )
         return
 
     # Recovery: a photo arrived, but we have no in-memory record of
@@ -1735,8 +1761,18 @@ async def qpay_callback(order_id: str):
 
 
 # ---------------------------------------------------------------------------
-# 4) MANUAL TESTING ENDPOINTS
+# 4) MANUAL TESTING / ADMIN ENDPOINTS -- all require ?secret=TEST_ENDPOINT_SECRET
 # ---------------------------------------------------------------------------
+def require_admin_secret(secret: str) -> None:
+    """Admin/test endpoints can deliver products or create real invoices, so
+    they're disabled entirely unless TEST_ENDPOINT_SECRET is set, and then
+    only work with the matching ?secret=..."""
+    if not TEST_ENDPOINT_SECRET:
+        raise HTTPException(status_code=403, detail="Disabled: TEST_ENDPOINT_SECRET is not set")
+    if not hmac.compare_digest(secret.encode("utf-8"), TEST_ENDPOINT_SECRET.encode("utf-8")):
+        raise HTTPException(status_code=403, detail="Invalid or missing secret")
+
+
 class CreateInvoiceRequest(BaseModel):
     order_id: str | None = None
     amount: float
@@ -1751,14 +1787,16 @@ class CreateInvoiceResponse(BaseModel):
 
 
 @app.post("/create-invoice", response_model=CreateInvoiceResponse)
-async def create_invoice(payload: CreateInvoiceRequest):
+async def create_invoice(payload: CreateInvoiceRequest, secret: str = ""):
+    require_admin_secret(secret)
     order_id = payload.order_id or f"AUTO-{uuid.uuid4().hex[:12]}"
     invoice = await create_qpay_invoice(order_id, payload.amount, payload.description)
     return CreateInvoiceResponse(**invoice)
 
 
 @app.get("/payment-status/{order_id}")
-async def payment_status(order_id: str):
+async def payment_status(order_id: str, secret: str = ""):
+    require_admin_secret(secret)
     record = INVOICES.get(order_id)
     if not record:
         raise HTTPException(status_code=404, detail="Unknown order_id")
@@ -1768,10 +1806,9 @@ async def payment_status(order_id: str):
 @app.post("/test-deliver")
 async def test_deliver(psid: str, product_index: int = 1, secret: str = ""):
     """TEST-ONLY: simulates a completed payment and runs the full delivery
-    flow (Messenger link + attachment attempt + email prompt) for a given
-    PSID, without needing a real QPay payment."""
-    if TEST_ENDPOINT_SECRET and secret != TEST_ENDPOINT_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid or missing secret")
+    flow (Messenger link + email prompt) for a given PSID, without needing
+    a real QPay payment."""
+    require_admin_secret(secret)
 
     product = next((p for p in PRODUCTS if p.index == product_index), None)
     if not product:
@@ -1794,8 +1831,7 @@ async def setup_messenger_profile_endpoint(secret: str = ""):
     menu + Get Started button to your Facebook Page. This is a one-time
     configuration call to Meta, not something that needs to run on every
     request."""
-    if TEST_ENDPOINT_SECRET and secret != TEST_ENDPOINT_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid or missing secret")
+    require_admin_secret(secret)
     await setup_messenger_profile()
     return {"status": "messenger profile updated"}
 
@@ -1806,8 +1842,7 @@ async def test_menu(psid: str, category: str | None = None, secret: str = ""):
     can check it looks right without needing to type 'menu' in Messenger
     yourself first. Pass ?category=... to test one category's carousel
     specifically (e.g. category=Ном); omitted, it shows every product."""
-    if TEST_ENDPOINT_SECRET and secret != TEST_ENDPOINT_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid or missing secret")
+    require_admin_secret(secret)
     await send_product_menu(psid, category=category)
     return {"status": "sent"}
 
@@ -1816,8 +1851,7 @@ async def test_menu(psid: str, category: str | None = None, secret: str = ""):
 async def test_category_menu(psid: str, secret: str = ""):
     """TEST-ONLY: sends the category-picker buttons to a given PSID, so
     you can check the Books/Guide split looks right before going live."""
-    if TEST_ENDPOINT_SECRET and secret != TEST_ENDPOINT_SECRET:
-        raise HTTPException(status_code=403, detail="Invalid or missing secret")
+    require_admin_secret(secret)
     await send_category_menu(psid)
     return {"status": "sent"}
 
