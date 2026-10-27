@@ -163,8 +163,9 @@ from qpay_client.v2.schemas import (
 )
 
 logging.basicConfig(level=logging.INFO)
-# httpx logs every request URL at INFO. The token is no longer in URLs
-# (see graph_headers), but request URLs still aren't worth the log noise.
+# httpx logs every request URL at INFO, and Graph API URLs carry
+# ?access_token=... -- keep them out of the logs. Failed calls raise
+# GraphAPIError (see raise_for_graph_error), whose message has no URL.
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("qpay_digital_bot")
@@ -186,10 +187,24 @@ GRAPH_API_VERSION = "v25.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
 
-def graph_headers() -> dict:
-    """The Page token goes in a header, never in the URL: httpx error
-    messages (and their tracebacks in the logs) include the full URL."""
-    return {"Authorization": f"Bearer {META_PAGE_ACCESS_TOKEN}"}
+def graph_params() -> dict:
+    """The Page token as the ?access_token= query parameter -- the form the
+    Send API is documented with. (An Authorization: Bearer header was tried
+    and Meta rejected every send with error 100/33.)"""
+    return {"access_token": META_PAGE_ACCESS_TOKEN}
+
+
+class GraphAPIError(Exception):
+    """Raised for a failed Graph API call. Unlike httpx.HTTPStatusError, its
+    message never includes the request URL, which contains the token."""
+
+
+def raise_for_graph_error(resp: httpx.Response) -> None:
+    if resp.is_error:
+        raise GraphAPIError(
+            f"Graph API {resp.request.method} {resp.request.url.path} "
+            f"failed: {resp.status_code} {resp.text[:500]}"
+        )
 
 TEST_ENDPOINT_SECRET = os.environ.get("TEST_ENDPOINT_SECRET", "")
 
@@ -723,7 +738,7 @@ async def get_customer_name(psid: str) -> str:
     params = {"fields": "first_name,last_name"}
     try:
         async with httpx.AsyncClient() as http_client:
-            resp = await http_client.get(url, params=params, headers=graph_headers())
+            resp = await http_client.get(url, params={**params, **graph_params()})
             data = resp.json()
 
         if "error" in data:
@@ -876,13 +891,13 @@ async def send_meta_message(recipient: dict, message: dict) -> None:
     url = f"{GRAPH_API_BASE}/me/messages"
     payload = {"recipient": recipient, "message": message, "messaging_type": "RESPONSE"}
     async with httpx.AsyncClient() as http_client:
-        resp = await http_client.post(url, headers=graph_headers(), json=payload)
+        resp = await http_client.post(url, params=graph_params(), json=payload)
         # Body only on errors: successful responses just echo IDs.
         if resp.is_error:
             logger.warning("Meta Send API error: %s %s", resp.status_code, resp.text)
         else:
             logger.info("Meta Send API: %s", resp.status_code)
-        resp.raise_for_status()
+        raise_for_graph_error(resp)
 
 
 def quick_reply(title: str, payload: str) -> dict:
@@ -1056,23 +1071,23 @@ async def setup_messenger_profile() -> None:
         ],
     }
     async with httpx.AsyncClient() as http_client:
-        resp = await http_client.post(url, headers=graph_headers(), json=payload)
+        resp = await http_client.post(url, params=graph_params(), json=payload)
         logger.info("Messenger profile setup response: %s %s", resp.status_code, resp.text)
-        resp.raise_for_status()
+        raise_for_graph_error(resp)
 
 
 async def like_comment(comment_id: str) -> None:
     url = f"{GRAPH_API_BASE}/{comment_id}/likes"
     async with httpx.AsyncClient() as http_client:
-        resp = await http_client.post(url, headers=graph_headers())
-        resp.raise_for_status()
+        resp = await http_client.post(url, params=graph_params())
+        raise_for_graph_error(resp)
 
 
 async def reply_to_comment(comment_id: str, message: str) -> None:
     url = f"{GRAPH_API_BASE}/{comment_id}/comments"
     async with httpx.AsyncClient() as http_client:
-        resp = await http_client.post(url, headers=graph_headers(), json={"message": message})
-        resp.raise_for_status()
+        resp = await http_client.post(url, params=graph_params(), json={"message": message})
+        raise_for_graph_error(resp)
 
 
 # ---------------------------------------------------------------------------
@@ -1658,8 +1673,15 @@ async def _debounced_text_worker(sender_id: str) -> None:
 
     texts = PENDING_TEXT_BUFFER.pop(sender_id, [])
     PENDING_TEXT_TASK.pop(sender_id, None)
-    if texts:
+    if not texts:
+        return
+    # This runs as its own task, outside process_webhook_event's error
+    # handling, so errors must be caught here or they vanish as
+    # "Task exception was never retrieved".
+    try:
         await process_text_messages(sender_id, texts)
+    except Exception:
+        logger.exception("Unhandled error replying to text from sender=%s", sender_id)
 
 
 async def process_text_messages(sender_id: str, texts: list[str]) -> None:

@@ -128,23 +128,23 @@ def test_manual_buy_shows_cancel_with_bank_details(secrets_and_stubs, monkeypatc
     assert "557" in bot.AWAITING_PAYMENT_SCREENSHOT
 
 
-def test_page_token_sent_in_header_not_url(monkeypatch):
+def test_failed_send_error_does_not_contain_token(monkeypatch):
     monkeypatch.setattr(bot, "META_PAGE_ACCESS_TOKEN", "tok123")
     monkeypatch.setattr(bot, "REPLY_DELAY_SECONDS", 0)
     seen = {}
 
     def handler(request):
         seen["url"] = str(request.url)
-        seen["auth"] = request.headers.get("authorization")
         return bot.httpx.Response(400, json={"error": {"message": "bad"}})
 
     real_client = bot.httpx.AsyncClient
     monkeypatch.setattr(bot.httpx, "AsyncClient",
                         lambda *a, **k: real_client(transport=bot.httpx.MockTransport(handler)))
-    with pytest.raises(bot.httpx.HTTPStatusError) as err:
+    with pytest.raises(bot.GraphAPIError) as err:
         asyncio.run(SEND_META_MESSAGE({"id": "1"}, {"text": "hi"}))
-    assert "tok123" not in seen["url"] and "tok123" not in str(err.value)
-    assert seen["auth"] == "Bearer tok123"
+    assert "access_token=tok123" in seen["url"]  # sent the documented way
+    assert "tok123" not in str(err.value) and "/me/messages" in str(err.value)
+    assert "400" in str(err.value) and "bad" in str(err.value)
 
 
 def test_httpx_does_not_log_request_urls():
