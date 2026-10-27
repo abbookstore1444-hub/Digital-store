@@ -1,7 +1,9 @@
-fastapi
-uvicorn[standard]
-httpx
-gspread
-google-auth
-pydantic
-qpay-client
+# Pinned so a new release can't break a deploy unexpectedly. These are the
+# versions the test workflow installed and passed with on 2026-10-27.
+fastapi==0.162.0
+uvicorn[standard]==0.54.0
+httpx==0.28.1
+gspread==6.2.1
+google-auth==2.62.0
+pydantic==2.14.1
+qpay-client==2.0.5
