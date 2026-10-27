@@ -159,3 +159,214 @@ def test_cancel_quick_reply_clears_pending_order(secrets_and_stubs, monkeypatch)
              "message": {"mid": "m3", "text": "x", "quick_reply": {"payload": "CANCEL_ORDER"}}}
     asyncio.run(bot.handle_messaging_event(event))
     assert "556" not in bot.AWAITING_PAYMENT_SCREENSHOT
+
+
+# --- Gemini screenshot check, Gemini answers and Telegram owner notifications ---
+
+PRODUCT = next(p for p in bot.PRODUCTS if p.index == 1)  # 15000₮
+ORDER = "555-1-abc123"
+GOOD_RECEIPT = {
+    "is_payment_receipt": True, "transfer_successful": True, "amount": 15000,
+    "recipient_account": "5123456789", "recipient_name": "Test Shop",
+    "transfer_date": "2026-10-27", "transaction_reference": "TX1", "looks_edited": False,
+}
+NOW = bot.datetime(2026, 10, 27, 12, tzinfo=bot.timezone.utc)
+
+
+@pytest.fixture
+def bank(monkeypatch):
+    monkeypatch.setattr(bot, "BANK_ACCOUNT_NUMBER", "5123456789")
+    monkeypatch.setattr(bot, "BANK_ACCOUNT_NAME", "")
+    bot.USED_RECEIPTS.clear()
+
+
+@pytest.fixture
+def owner(monkeypatch, bank):
+    """Telegram + Gemini configured; records what reaches the owner and what gets delivered."""
+    monkeypatch.setattr(bot, "TELEGRAM_BOT_TOKEN", "123:abc")
+    monkeypatch.setattr(bot, "TELEGRAM_ADMIN_CHAT_ID", "99")
+    monkeypatch.setattr(bot, "GEMINI_API_KEY", "gemini-key")
+    rec = {"notify": [], "delivered": [], "telegram": [], "menu": []}
+
+    async def fake_notify(text, photo=None, buttons=None):
+        rec["notify"].append((text, photo, buttons))
+
+    async def fake_fulfill(order_id):
+        rec["delivered"].append(order_id)
+
+    async def fake_download(url):
+        return b"image-bytes", "image/jpeg"
+
+    async def fake_telegram(method, data, files=None):
+        rec["telegram"].append((method, data))
+
+    async def fake_menu(psid, *a):
+        rec["menu"].append(psid)
+
+    monkeypatch.setattr(bot, "notify_owner", fake_notify)
+    monkeypatch.setattr(bot, "fulfill_manual_order", fake_fulfill)
+    monkeypatch.setattr(bot, "download_image", fake_download)
+    monkeypatch.setattr(bot, "telegram_call", fake_telegram)
+    monkeypatch.setattr(bot, "send_category_menu", fake_menu)
+    monkeypatch.setitem(bot.INVOICES, ORDER, {
+        "invoice_id": "MANUAL", "status": "PENDING", "psid": "555", "product_index": 1, "email": None,
+    })
+    return rec
+
+
+def gemini_returns(monkeypatch, result):
+    async def fake_gemini(parts, schema):
+        if isinstance(result, Exception):
+            raise result
+        return result
+    monkeypatch.setattr(bot, "gemini_json", fake_gemini)
+
+
+def photo_event(mid="p1"):
+    return {"sender": {"id": "555"}, "timestamp": 10,
+            "message": {"mid": mid, "attachments": [{"type": "image", "payload": {"url": "https://cdn/x.jpg"}}]}}
+
+
+def test_judge_receipt_accepts_the_right_payment(bank):
+    assert bot.judge_receipt(GOOD_RECEIPT, PRODUCT, "img:1", now=NOW) == (True, "OK")
+
+
+@pytest.mark.parametrize("change", [
+    {"amount": 10000},
+    {"amount": None},
+    {"recipient_account": "5999999999"},
+    {"is_payment_receipt": False},
+    {"transfer_successful": False},
+    {"looks_edited": True},
+    {"recipient_account": None, "recipient_name": None},
+    {"transfer_date": "2026-10-01"},
+])
+def test_judge_receipt_rejects_doubtful_screenshots(bank, change):
+    accepted, reason = bot.judge_receipt({**GOOD_RECEIPT, **change}, PRODUCT, "img:1", now=NOW)
+    assert not accepted and reason
+
+
+def test_judge_receipt_rejects_a_reused_receipt(bank):
+    bot.USED_RECEIPTS.add("ref:TX1")
+    assert not bot.judge_receipt(GOOD_RECEIPT, PRODUCT, "img:new", now=NOW)[0]
+
+
+def test_judge_receipt_needs_bank_details(bank, monkeypatch):
+    monkeypatch.setattr(bot, "BANK_ACCOUNT_NUMBER", "")
+    assert not bot.judge_receipt(GOOD_RECEIPT, PRODUCT, "img:1", now=NOW)[0]
+
+
+@pytest.mark.parametrize("seen,ok", [
+    ("5123456789", True), ("5123 4567 89", True), ("MN12 0005 0051 2345 6789", True),
+    ("****6789", True), ("5123****6789", True), ("****1111", False), ("9999****6789", False),
+    ("", False), (None, False),
+])
+def test_account_matches(seen, ok):
+    assert bot.account_matches(seen, "5123456789") is ok
+
+
+def test_good_screenshot_is_delivered_without_the_owner(secrets_and_stubs, owner, monkeypatch):
+    gemini_returns(monkeypatch, {**GOOD_RECEIPT, "transfer_date": None})
+    bot.AWAITING_PAYMENT_SCREENSHOT["555"] = ORDER
+    asyncio.run(bot.handle_messaging_event(photo_event()))
+    assert owner["delivered"] == [ORDER] and owner["notify"] == []
+    assert "ref:TX1" in bot.USED_RECEIPTS
+
+
+def test_doubtful_screenshot_goes_to_the_owner(secrets_and_stubs, owner, monkeypatch):
+    gemini_returns(monkeypatch, {**GOOD_RECEIPT, "amount": 5000, "transfer_date": None})
+    bot.AWAITING_PAYMENT_SCREENSHOT["555"] = ORDER
+    asyncio.run(bot.handle_messaging_event(photo_event()))
+    assert owner["delivered"] == []
+    text, photo, buttons = owner["notify"][0]
+    assert "5000" in text and photo == (b"image-bytes", "image/jpeg")
+    assert [b["callback_data"] for b in buttons["inline_keyboard"][0]] == [f"pay:ok:{ORDER}", f"pay:no:{ORDER}"]
+    assert secrets_and_stubs[-1][1]["text"] == bot.PAYMENT_UNDER_REVIEW_TEXT
+
+
+def test_gemini_failure_sends_screenshot_to_the_owner(secrets_and_stubs, owner, monkeypatch):
+    gemini_returns(monkeypatch, bot.GeminiError("all busy"))
+    bot.AWAITING_PAYMENT_SCREENSHOT["555"] = ORDER
+    asyncio.run(bot.handle_messaging_event(photo_event()))
+    assert owner["delivered"] == [] and len(owner["notify"]) == 1
+
+
+def test_without_telegram_any_photo_still_delivers(secrets_and_stubs, owner, monkeypatch):
+    monkeypatch.setattr(bot, "TELEGRAM_ADMIN_CHAT_ID", "")
+    bot.AWAITING_PAYMENT_SCREENSHOT["555"] = ORDER
+    asyncio.run(bot.handle_messaging_event(photo_event()))
+    assert owner["delivered"] == [ORDER]
+
+
+def telegram_post(body, secret=None):
+    headers = {"X-Telegram-Bot-Api-Secret-Token": secret if secret is not None else bot.telegram_webhook_secret()}
+    return client.post("/telegram-webhook", json=body, headers=headers)
+
+
+def callback(data, chat_id=99):
+    return {"callback_query": {"id": "cb1", "data": data,
+                               "message": {"message_id": 5, "chat": {"id": chat_id}, "caption": "x", "photo": [{}]}}}
+
+
+def test_telegram_webhook_needs_the_secret(owner):
+    assert telegram_post(callback(f"pay:ok:{ORDER}"), secret="wrong").status_code == 403
+    assert owner["delivered"] == []
+
+
+def test_owner_approve_delivers(owner):
+    assert telegram_post(callback(f"pay:ok:{ORDER}")).status_code == 200
+    assert owner["delivered"] == [ORDER]
+    assert [m for m, _ in owner["telegram"]] == ["answerCallbackQuery", "editMessageCaption"]
+    assert owner["telegram"][1][1]["reply_markup"] == {"inline_keyboard": []}
+
+
+def test_owner_reject_asks_the_customer_again(secrets_and_stubs, owner):
+    telegram_post(callback(f"pay:no:{ORDER}"))
+    assert owner["delivered"] == []
+    assert secrets_and_stubs[-1][1]["text"] == bot.PAYMENT_REJECTED_TEXT
+    assert bot.AWAITING_PAYMENT_SCREENSHOT["555"] == ORDER
+
+
+def test_buttons_from_another_chat_do_nothing(owner):
+    telegram_post(callback(f"pay:ok:{ORDER}", chat_id=7))
+    assert owner["delivered"] == []
+
+
+def test_question_answered_by_gemini_then_menu(secrets_and_stubs, owner, monkeypatch):
+    gemini_returns(monkeypatch, {"reply": "Сайн байна уу!", "needs_owner": False, "product_index": None})
+    asyncio.run(bot.process_text_messages("700", ["сайн уу"]))
+    assert secrets_and_stubs[-1][1]["text"] == "Сайн байна уу!"
+    assert owner["menu"] == ["700"] and owner["notify"] == []
+
+
+def test_question_gemini_cannot_answer_reaches_the_owner(secrets_and_stubs, owner, monkeypatch):
+    gemini_returns(monkeypatch, {"reply": "Эзэн удахгүй хариулна.", "needs_owner": True, "product_index": None})
+    asyncio.run(bot.process_text_messages("700", ["мөнгөө буцааж авмаар байна"]))
+    assert "мөнгөө буцааж авмаар байна" in owner["notify"][0][0]
+
+
+def test_question_about_a_product_shows_its_buy_button(secrets_and_stubs, owner, monkeypatch):
+    gemini_returns(monkeypatch, {"reply": "Тийм ээ.", "needs_owner": False, "product_index": 1})
+    asyncio.run(bot.process_text_messages("700", ["test ebook авмаар байна"]))
+    buttons = secrets_and_stubs[-1][1]["attachment"]["payload"]["buttons"]
+    assert buttons[0]["payload"] == PRODUCT.payload and owner["menu"] == []
+
+
+def test_gemini_failure_falls_back_to_the_fixed_reply(secrets_and_stubs, owner, monkeypatch):
+    gemini_returns(monkeypatch, bot.GeminiError("busy"))
+    asyncio.run(bot.process_text_messages("700", ["hi"]))
+    assert secrets_and_stubs[-1][1]["text"] == bot.FALLBACK_REPLY_TEXT
+
+
+def test_error_logs_reach_the_owner_once(owner):
+    handler = next(h for h in bot.logger.handlers if isinstance(h, bot.TelegramErrorHandler))
+    handler.last_sent.clear()
+
+    async def run():
+        bot.logger.error("Delivery failed for order X")
+        bot.logger.error("Delivery failed for order X")
+        bot.logger.warning("just a warning")
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    assert len(owner["notify"]) == 1 and "Delivery failed" in owner["notify"][0][0]
