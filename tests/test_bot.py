@@ -115,6 +115,22 @@ def test_screenshot_reminder_has_cancel_and_menu_buttons(secrets_and_stubs):
     assert bot.AWAITING_PAYMENT_SCREENSHOT["555"] == "order-1"  # still waiting
 
 
+def test_manual_buy_shows_cancel_with_bank_details(secrets_and_stubs, monkeypatch):
+    monkeypatch.setattr(bot, "PAYMENT_MODE", "manual")
+    monkeypatch.setattr(bot, "log_new_order", lambda *a, **k: None)
+    monkeypatch.setattr(bot, "COMMENTER_NAMES", {"557": "Test"})
+    event = {"sender": {"id": "557"}, "timestamp": 3, "postback": {"payload": "QPAY_PAY_1"}}
+    asyncio.run(bot.handle_messaging_event(event))
+    _, message = secrets_and_stubs[-1]
+    assert [q["payload"] for q in message.get("quick_replies", [])] == ["CANCEL_ORDER", "VIEW_MENU"]
+    assert "557" in bot.AWAITING_PAYMENT_SCREENSHOT
+
+
+def test_httpx_does_not_log_request_urls():
+    import logging
+    assert not logging.getLogger("httpx").isEnabledFor(logging.INFO)
+
+
 def test_cancel_quick_reply_clears_pending_order(secrets_and_stubs, monkeypatch):
     monkeypatch.setattr(bot, "mark_order_cancelled", lambda order_id: None)
     bot.AWAITING_PAYMENT_SCREENSHOT["556"] = "order-2"

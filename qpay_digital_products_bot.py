@@ -163,6 +163,10 @@ from qpay_client.v2.schemas import (
 )
 
 logging.basicConfig(level=logging.INFO)
+# httpx logs every request URL at INFO, and Graph API URLs carry
+# ?access_token=... -- that put the Page access token in Render's logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger("qpay_digital_bot")
 
 app = FastAPI(title="QPay Digital Products Messenger Bot")
@@ -880,6 +884,14 @@ def quick_reply(title: str, payload: str) -> dict:
     return {"content_type": "text", "title": title[:20], "payload": payload}
 
 
+def awaiting_payment_quick_replies() -> list[dict]:
+    """Cancel / back-to-menu buttons shown while a manual payment is pending."""
+    return [
+        quick_reply(CANCEL_ORDER_BUTTON_TEXT, "CANCEL_ORDER"),
+        quick_reply(VIEW_MENU_BUTTON_TEXT, "VIEW_MENU"),
+    ]
+
+
 async def clear_awaiting_state(sender_id: str) -> str | None:
     """Clears any pending screenshot/email wait for this customer (used
     when they tap Cancel/Skip/Menu to escape one of those states). Returns
@@ -1477,7 +1489,12 @@ async def handle_messaging_event(event: dict) -> None:
                 # it's already shown as part of the Buy button message
                 # itself (see send_pay_button). Repeating it here would
                 # just duplicate it right before the payment instructions.
-                await send_meta_message({"id": sender_id}, {"text": payment_text})
+                # Cancel/Menu buttons go right on the instructions, so the
+                # way out is visible immediately, not only after a reminder.
+                await send_meta_message(
+                    {"id": sender_id},
+                    {"text": payment_text, "quick_replies": awaiting_payment_quick_replies()},
+                )
                 return
 
             invoice = await create_qpay_invoice(
@@ -1574,13 +1591,7 @@ async def handle_messaging_event(event: dict) -> None:
         # customer who changed their mind isn't stuck in this state.
         await send_meta_message(
             {"id": sender_id},
-            {
-                "text": AWAITING_SCREENSHOT_REMINDER_TEXT,
-                "quick_replies": [
-                    quick_reply(CANCEL_ORDER_BUTTON_TEXT, "CANCEL_ORDER"),
-                    quick_reply(VIEW_MENU_BUTTON_TEXT, "VIEW_MENU"),
-                ],
-            },
+            {"text": AWAITING_SCREENSHOT_REMINDER_TEXT, "quick_replies": awaiting_payment_quick_replies()},
         )
         return
 
