@@ -1896,6 +1896,38 @@ async def health_check():
     return {"status": "ok", "qpay_env": QPAY_ENV, "products_configured": len(PRODUCTS)}
 
 
+@app.on_event("startup")
+async def log_page_token_identity() -> None:
+    """Logs what META_PAGE_ACCESS_TOKEN belongs to -- its owner's ID/name and
+    the token's length -- never the token itself. A Page token shows the
+    Page's name; a User token shows a person's name, which explains Send
+    API error 100/33 ("Object with ID 'me' does not exist")."""
+    token = META_PAGE_ACCESS_TOKEN
+    if not token:
+        logger.critical("META_PAGE_ACCESS_TOKEN is not set")
+        return
+    if token != token.strip() or token[:1] in "\"'":
+        logger.warning("META_PAGE_ACCESS_TOKEN has surrounding spaces or quotes -- remove them on Render")
+    try:
+        async with httpx.AsyncClient(timeout=15) as http_client:
+            resp = await http_client.get(
+                f"{GRAPH_API_BASE}/me", params={"fields": "id,name", **graph_params()}
+            )
+        data = resp.json()
+        if "error" in data:
+            logger.warning(
+                "Page token check failed (length %d): %s",
+                len(token), json.dumps(data["error"])[:300],
+            )
+        else:
+            logger.info(
+                "Page token belongs to id=%s name=%r (length %d). This should be your Page.",
+                data.get("id"), data.get("name"), len(token),
+            )
+    except Exception as e:
+        logger.warning("Page token check could not run: %s", type(e).__name__)
+
+
 # ---------------------------------------------------------------------------
 # 5) PRIVACY POLICY
 # ---------------------------------------------------------------------------
