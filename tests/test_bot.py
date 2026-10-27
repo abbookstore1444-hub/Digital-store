@@ -352,6 +352,33 @@ def test_question_about_a_product_shows_its_buy_button(secrets_and_stubs, owner,
     assert buttons[0]["payload"] == PRODUCT.payload and owner["menu"] == []
 
 
+def test_question_during_payment_gets_a_gemini_answer(secrets_and_stubs, owner, monkeypatch):
+    seen = {}
+
+    async def fake_gemini(parts, schema):
+        seen["prompt"] = parts[0]["text"]
+        return {"reply": "Excel-ийн томъёо заадаг. Төлбөрөө хийгээд зургаа илгээнэ үү.", "needs_owner": False, "product_index": 1}
+
+    monkeypatch.setattr(bot, "gemini_json", fake_gemini)
+    bot.AWAITING_PAYMENT_SCREENSHOT["555"] = ORDER
+    event = {"sender": {"id": "555"}, "timestamp": 11, "message": {"mid": "q1", "text": "энэ ном юу заадаг вэ"}}
+    asyncio.run(bot.handle_messaging_event(event))
+    _, message = secrets_and_stubs[-1]
+    assert message["text"].startswith("Excel-ийн томъёо")
+    assert [q["payload"] for q in message["quick_replies"]] == ["CANCEL_ORDER", "VIEW_MENU"]
+    assert "waiting for a screenshot" in seen["prompt"] and "Test ebook" in seen["prompt"]
+    assert bot.AWAITING_PAYMENT_SCREENSHOT["555"] == ORDER and owner["menu"] == []
+
+
+def test_question_during_payment_falls_back_to_the_reminder(secrets_and_stubs, owner, monkeypatch):
+    gemini_returns(monkeypatch, bot.GeminiError("busy"))
+    bot.AWAITING_PAYMENT_SCREENSHOT["555"] = ORDER
+    event = {"sender": {"id": "555"}, "timestamp": 12, "message": {"mid": "q2", "text": "hello"}}
+    asyncio.run(bot.handle_messaging_event(event))
+    assert secrets_and_stubs[-1][1]["text"] == bot.AWAITING_SCREENSHOT_REMINDER_TEXT
+    assert bot.AWAITING_PAYMENT_SCREENSHOT["555"] == ORDER
+
+
 def test_gemini_failure_falls_back_to_the_fixed_reply(secrets_and_stubs, owner, monkeypatch):
     gemini_returns(monkeypatch, bot.GeminiError("busy"))
     asyncio.run(bot.process_text_messages("700", ["hi"]))
