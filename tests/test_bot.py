@@ -364,6 +364,7 @@ def test_gemini_is_told_not_to_promise_the_owner(secrets_and_stubs, owner, monke
     monkeypatch.setattr(bot, "gemini_json", fake_gemini)
     asyncio.run(bot.process_text_messages("700", ["hi"]))
     assert "Never say that the owner" in seen["prompt"] and "owner will reply soon" not in seen["prompt"]
+    assert "NO refunds" in seen["prompt"] and "буцаан олгохгүй" in seen["prompt"]
 
 
 def test_customer_contact_reads_name_from_the_conversation(monkeypatch):
