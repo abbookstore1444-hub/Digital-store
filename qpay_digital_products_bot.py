@@ -406,6 +406,9 @@ AWAITING_SCREENSHOT_REMINDER_TEXT = os.environ.get(
 # Quick-reply labels on the reminder above -- a one-tap way out for a
 # customer who changed their mind, instead of only ever getting the same
 # reminder no matter what they type. See handle_messaging_event.
+# Off by default while there's a single product; set to "true" to show
+# the Cancel / Menu buttons on payment messages again.
+SHOW_PAYMENT_BUTTONS = os.environ.get("SHOW_PAYMENT_BUTTONS", "false").lower() == "true"
 CANCEL_ORDER_BUTTON_TEXT = os.environ.get("CANCEL_ORDER_BUTTON_TEXT", "\u274C Цуцлах")
 VIEW_MENU_BUTTON_TEXT = os.environ.get("VIEW_MENU_BUTTON_TEXT", "Үндсэн цэсрүү буцах")
 ORDER_CANCELLED_TEXT = os.environ.get(
@@ -1013,11 +1016,24 @@ def quick_reply(title: str, payload: str) -> dict:
 
 
 def awaiting_payment_quick_replies() -> list[dict]:
-    """Cancel / back-to-menu buttons shown while a manual payment is pending."""
+    """Cancel / back-to-menu buttons shown while a manual payment is pending,
+    or none when SHOW_PAYMENT_BUTTONS is off."""
+    if not SHOW_PAYMENT_BUTTONS:
+        return []
     return [
         quick_reply(CANCEL_ORDER_BUTTON_TEXT, "CANCEL_ORDER"),
         quick_reply(VIEW_MENU_BUTTON_TEXT, "VIEW_MENU"),
     ]
+
+
+def payment_message(text: str) -> dict:
+    """A message sent while a payment is pending, with the Cancel / Menu
+    buttons when they're on (Messenger rejects an empty quick_replies list)."""
+    message = {"text": text}
+    buttons = awaiting_payment_quick_replies()
+    if buttons:
+        message["quick_replies"] = buttons
+    return message
 
 
 async def clear_awaiting_state(sender_id: str) -> str | None:
@@ -1796,7 +1812,7 @@ async def handle_payment_photo(sender_id: str, order_id: str, attachments: list[
         logger.info("Screenshot for order %s turned down (%s), customer asked again", order_id, reason)
         await send_meta_message(
             {"id": sender_id},
-            {"text": tell_customer, "quick_replies": awaiting_payment_quick_replies()},
+            payment_message(tell_customer),
         )
         return
 
@@ -1839,7 +1855,7 @@ async def handle_owner_decision(callback: dict) -> None:
         AWAITING_PAYMENT_SCREENSHOT[psid] = order_id
         await send_meta_message(
             {"id": psid},
-            {"text": PAYMENT_REJECTED_TEXT, "quick_replies": awaiting_payment_quick_replies()},
+            payment_message(PAYMENT_REJECTED_TEXT),
         )
         result = "❌ Татгалзсан, хэрэглэгчид мэдэгдлээ"
     await telegram_call("answerCallbackQuery", {"callback_query_id": callback.get("id"), "text": result})
@@ -2154,7 +2170,7 @@ async def handle_messaging_event(event: dict) -> None:
                 # way out is visible immediately, not only after a reminder.
                 await send_meta_message(
                     {"id": sender_id},
-                    {"text": payment_text, "quick_replies": awaiting_payment_quick_replies()},
+                    payment_message(payment_text),
                 )
                 return
 
@@ -2268,7 +2284,7 @@ async def handle_messaging_event(event: dict) -> None:
                 return
         await send_meta_message(
             {"id": sender_id},
-            {"text": AWAITING_SCREENSHOT_REMINDER_TEXT, "quick_replies": awaiting_payment_quick_replies()},
+            payment_message(AWAITING_SCREENSHOT_REMINDER_TEXT),
         )
         return
 

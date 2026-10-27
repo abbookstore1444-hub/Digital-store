@@ -107,7 +107,17 @@ def test_summarize_webhook_hides_text_and_names():
     assert "secret address" not in line and "Bat" not in line and "hello" not in line
 
 
-def test_screenshot_reminder_has_cancel_and_menu_buttons(secrets_and_stubs):
+def test_payment_messages_have_no_buttons_by_default(secrets_and_stubs):
+    bot.AWAITING_PAYMENT_SCREENSHOT["555"] = "order-1"
+    event = {"sender": {"id": "555"}, "timestamp": 1, "message": {"mid": "m1", "text": "paid?"}}
+    asyncio.run(bot.handle_messaging_event(event))
+    _, message = secrets_and_stubs[-1]
+    assert message == {"text": bot.AWAITING_SCREENSHOT_REMINDER_TEXT}
+    assert bot.AWAITING_PAYMENT_SCREENSHOT["555"] == "order-1"  # still waiting
+
+
+def test_screenshot_reminder_has_cancel_and_menu_buttons(secrets_and_stubs, monkeypatch):
+    monkeypatch.setattr(bot, "SHOW_PAYMENT_BUTTONS", True)
     bot.AWAITING_PAYMENT_SCREENSHOT["555"] = "order-1"
     event = {"sender": {"id": "555"}, "timestamp": 1, "message": {"mid": "m2", "text": "paid?"}}
     asyncio.run(bot.handle_messaging_event(event))
@@ -118,6 +128,7 @@ def test_screenshot_reminder_has_cancel_and_menu_buttons(secrets_and_stubs):
 
 
 def test_manual_buy_shows_cancel_with_bank_details(secrets_and_stubs, monkeypatch):
+    monkeypatch.setattr(bot, "SHOW_PAYMENT_BUTTONS", True)
     monkeypatch.setattr(bot, "PAYMENT_MODE", "manual")
     monkeypatch.setattr(bot, "log_new_order", lambda *a, **k: None)
     monkeypatch.setattr(bot, "COMMENTER_NAMES", {"557": "Test"})
@@ -293,7 +304,7 @@ def test_wrong_amount_is_explained_to_the_customer(secrets_and_stubs, owner, mon
     assert owner["delivered"] == [] and owner["notify"] == []
     _, message = secrets_and_stubs[-1]
     assert "5000₮" in message["text"] and "15000₮" in message["text"]
-    assert [q["payload"] for q in message["quick_replies"]] == ["CANCEL_ORDER", "VIEW_MENU"]
+    assert "quick_replies" not in message
     assert bot.AWAITING_PAYMENT_SCREENSHOT["555"] == ORDER  # waiting for a new screenshot
 
 
@@ -434,7 +445,7 @@ def test_question_during_payment_gets_a_gemini_answer(secrets_and_stubs, owner, 
     asyncio.run(bot.handle_messaging_event(event))
     _, message = secrets_and_stubs[-1]
     assert message["text"].startswith("Excel-ийн томъёо")
-    assert [q["payload"] for q in message["quick_replies"]] == ["CANCEL_ORDER", "VIEW_MENU"]
+    assert "quick_replies" not in message
     assert "waiting for a screenshot" in seen["prompt"] and "Test ebook" in seen["prompt"]
     assert "цахим гарын авлага" in seen["prompt"] and "хэвлэмэл ном биш" in seen["prompt"]
     assert bot.AWAITING_PAYMENT_SCREENSHOT["555"] == ORDER and owner["menu"] == []
