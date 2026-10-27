@@ -460,6 +460,33 @@ def test_question_during_payment_falls_back_to_the_reminder(secrets_and_stubs, o
     assert bot.AWAITING_PAYMENT_SCREENSHOT["555"] == ORDER
 
 
+def test_small_talk_gets_one_line_and_no_menu(secrets_and_stubs, owner, monkeypatch):
+    seen = {}
+
+    async def fake_gemini(parts, schema):
+        seen["prompt"] = parts[0]["text"]
+        return {"reply": "Баярлалаа! 😊", "needs_owner": False, "small_talk": True, "product_index": None}
+
+    monkeypatch.setattr(bot, "gemini_json", fake_gemini)
+    monkeypatch.setattr(bot, "RECENT_BUYERS", {"700"})
+    asyncio.run(bot.process_text_messages("700", ["баярлалаа"]))
+    assert [m for _, m in secrets_and_stubs] == [{"text": "Баярлалаа! 😊"}]
+    assert owner["menu"] == []
+    assert "already bought" in seen["prompt"]
+
+
+def test_ok_during_payment_is_reminded_only_once(secrets_and_stubs, owner, monkeypatch):
+    gemini_returns(monkeypatch, {"reply": "Төлбөрөө хийгээд баримтаа илгээнэ үү.", "needs_owner": False,
+                                 "small_talk": True, "product_index": None})
+    bot.SMALL_TALK_REMINDED.clear()
+    for i, word in enumerate(["ok", "за", "ok"]):
+        bot.AWAITING_PAYMENT_SCREENSHOT["555"] = ORDER
+        event = {"sender": {"id": "555"}, "timestamp": 20 + i, "message": {"mid": f"ok{i}", "text": word}}
+        asyncio.run(bot.handle_messaging_event(event))
+    assert [m["text"] for _, m in secrets_and_stubs] == ["Төлбөрөө хийгээд баримтаа илгээнэ үү."]
+    assert bot.AWAITING_PAYMENT_SCREENSHOT["555"] == ORDER
+
+
 def test_gemini_failure_falls_back_to_the_fixed_reply(secrets_and_stubs, owner, monkeypatch):
     gemini_returns(monkeypatch, bot.GeminiError("busy"))
     asyncio.run(bot.process_text_messages("700", ["hi"]))
