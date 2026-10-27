@@ -202,6 +202,9 @@ CALLBACK_BASE_URL = os.environ.get("CALLBACK_BASE_URL", "https://example.com")
 META_VERIFY_TOKEN = os.environ.get("META_VERIFY_TOKEN", "")
 META_PAGE_ACCESS_TOKEN = os.environ.get("META_PAGE_ACCESS_TOKEN", "")
 META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
+# The Page's own id, filled in at startup from the token check (see
+# log_page_token_identity). Used to build Page inbox links for the owner.
+PAGE_ID = ""
 GRAPH_API_VERSION = "v25.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
@@ -821,6 +824,41 @@ async def get_customer_name(psid: str) -> str:
     except Exception as e:
         logger.warning("Exception fetching name for psid=%s: %s", psid, e)
         return ""
+
+
+async def customer_contact(psid: str) -> tuple[str, str]:
+    """The customer's name and a link that opens their chat in the Page
+    inbox, for the owner's Telegram messages. The profile lookup above is
+    usually refused, but the conversation's participant list -- which the
+    Page token can read -- still carries the name."""
+    name = COMMENTER_NAMES.get(psid, "")
+    conversation_link = ""
+    try:
+        async with httpx.AsyncClient(timeout=15) as http_client:
+            resp = await http_client.get(
+                f"{GRAPH_API_BASE}/me/conversations",
+                params={"user_id": psid, "platform": "messenger", "fields": "link,participants", **graph_params()},
+            )
+        conversations = resp.json().get("data") or []
+    except Exception as e:
+        logger.warning("Could not look up the conversation for psid=%s: %s", psid, type(e).__name__)
+        conversations = []
+    if conversations:
+        conv = conversations[0]
+        if not name:
+            name = next(
+                (p.get("name", "") for p in conv.get("participants", {}).get("data", []) if p.get("id") == psid), ""
+            )
+        if conv.get("link"):
+            conversation_link = "https://www.facebook.com" + conv["link"]
+    if PAGE_ID:
+        link = (
+            "https://business.facebook.com/latest/inbox/all"
+            f"?asset_id={PAGE_ID}&mailbox_id={PAGE_ID}&selected_item_id={psid}"
+        )
+    else:
+        link = conversation_link or "https://business.facebook.com/latest/inbox/all"
+    return name, link
 
 
 # In-memory "databases". Reset on restart -- fine for testing, swap for a
@@ -1533,10 +1571,10 @@ async def gemini_reply(sender_id: str, text: str, situation: str = "", quick_rep
         message["quick_replies"] = quick_replies
     await send_meta_message({"id": sender_id}, message)
     if result.get("needs_owner"):
-        name = COMMENTER_NAMES.get(sender_id) or "нэр тодорхойгүй"
+        name, link = await customer_contact(sender_id)
         await notify_owner(
-            "\U0001F4AC Хэрэглэгчийн асуултад Page-ийн inbox-оос хариулна уу\n"
-            f"Хэрэглэгч: {name}\nМессеж: {text[:1000]}"
+            "\U0001F4AC Хэрэглэгчийн асуултад хариулна уу\n"
+            f"Хэрэглэгч: {name or 'нэр тодорхойгүй'}\nМессеж: {text[:1000]}\nЧат нээх: {link}"
         )
     return result
 
@@ -1716,12 +1754,14 @@ async def handle_payment_photo(sender_id: str, order_id: str, attachments: list[
     logger.info("Screenshot for order %s sent to the owner: %s", order_id, reason)
     await send_meta_message({"id": sender_id}, {"text": PAYMENT_UNDER_REVIEW_TEXT})
     what = f"{product.description} -- {product.amount:.0f}₮" if product else "?"
+    name, link = await customer_contact(sender_id)
     await notify_owner(
         "\U0001F9FE Төлбөрийг шалгана уу\n"
         f"Бүтээгдэхүүн: {what}\n"
-        f"Хэрэглэгч: {COMMENTER_NAMES.get(sender_id) or 'нэр тодорхойгүй'}\n"
+        f"Хэрэглэгч: {name or 'нэр тодорхойгүй'}\n"
         f"Шалтгаан: {reason}\n"
-        f"Захиалга: {order_id}",
+        f"Захиалга: {order_id}\n"
+        f"Чат нээх: {link}",
         photo=photo,
         buttons=decision_buttons(order_id),
     )
@@ -2490,6 +2530,8 @@ async def log_page_token_identity() -> None:
                 len(token), json.dumps(data["error"])[:300],
             )
         else:
+            global PAGE_ID
+            PAGE_ID = str(data.get("id") or "")
             logger.info(
                 "Page token belongs to id=%s name=%r (length %d). This should be your Page.",
                 data.get("id"), data.get("name"), len(token),

@@ -208,6 +208,11 @@ def owner(monkeypatch, bank):
     monkeypatch.setattr(bot, "download_image", fake_download)
     monkeypatch.setattr(bot, "telegram_call", fake_telegram)
     monkeypatch.setattr(bot, "send_category_menu", fake_menu)
+
+    async def fake_contact(psid):
+        return "Болор Цэцэг", f"https://inbox/{psid}"
+
+    monkeypatch.setattr(bot, "customer_contact", fake_contact)
     monkeypatch.setitem(bot.INVOICES, ORDER, {
         "invoice_id": "MANUAL", "status": "PENDING", "psid": "555", "product_index": 1, "email": None,
     })
@@ -280,6 +285,7 @@ def test_doubtful_screenshot_goes_to_the_owner(secrets_and_stubs, owner, monkeyp
     assert owner["delivered"] == []
     text, photo, buttons = owner["notify"][0]
     assert "5000" in text and photo == (b"image-bytes", "image/jpeg")
+    assert "Болор Цэцэг" in text and "https://inbox/555" in text
     assert [b["callback_data"] for b in buttons["inline_keyboard"][0]] == [f"pay:ok:{ORDER}", f"pay:no:{ORDER}"]
     assert secrets_and_stubs[-1][1]["text"] == bot.PAYMENT_UNDER_REVIEW_TEXT
 
@@ -342,7 +348,27 @@ def test_question_answered_by_gemini_then_menu(secrets_and_stubs, owner, monkeyp
 def test_question_gemini_cannot_answer_reaches_the_owner(secrets_and_stubs, owner, monkeypatch):
     gemini_returns(monkeypatch, {"reply": "Эзэн удахгүй хариулна.", "needs_owner": True, "product_index": None})
     asyncio.run(bot.process_text_messages("700", ["мөнгөө буцааж авмаар байна"]))
-    assert "мөнгөө буцааж авмаар байна" in owner["notify"][0][0]
+    text = owner["notify"][0][0]
+    assert "мөнгөө буцааж авмаар байна" in text
+    assert "Болор Цэцэг" in text and "https://inbox/700" in text
+
+
+def test_customer_contact_reads_name_from_the_conversation(monkeypatch):
+    monkeypatch.setattr(bot, "PAGE_ID", "1304")
+    monkeypatch.setattr(bot, "COMMENTER_NAMES", {})
+
+    def handler(request):
+        assert request.url.path.endswith("/me/conversations")
+        assert request.url.params["user_id"] == "555"
+        return bot.httpx.Response(200, json={"data": [{"link": "/x/inbox/1", "participants": {"data": [
+            {"id": "1304", "name": "Уншлагын өртөө"}, {"id": "555", "name": "Сарнай Дорж"}]}}]})
+
+    real_client = bot.httpx.AsyncClient
+    monkeypatch.setattr(bot.httpx, "AsyncClient",
+                        lambda *a, **k: real_client(transport=bot.httpx.MockTransport(handler)))
+    name, link = asyncio.run(bot.customer_contact("555"))
+    assert name == "Сарнай Дорж"
+    assert "asset_id=1304" in link and "selected_item_id=555" in link
 
 
 def test_question_about_a_product_shows_its_buy_button(secrets_and_stubs, owner, monkeypatch):
