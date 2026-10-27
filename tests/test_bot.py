@@ -351,6 +351,16 @@ def test_question_gemini_cannot_answer_reaches_the_owner(secrets_and_stubs, owne
     text = owner["notify"][0][0]
     assert "мөнгөө буцааж авмаар байна" in text
     assert "Болор Цэцэг" in text and "https://inbox/700" in text
+    assert secrets_and_stubs == [] and owner["menu"] == []  # nothing goes to the customer
+
+
+def test_question_during_payment_for_the_owner_sends_nothing(secrets_and_stubs, owner, monkeypatch):
+    gemini_returns(monkeypatch, {"reply": "Эзэн хариулна.", "needs_owner": True, "product_index": None})
+    bot.AWAITING_PAYMENT_SCREENSHOT["555"] = ORDER
+    event = {"sender": {"id": "555"}, "timestamp": 13, "message": {"mid": "q3", "text": "буцаалт хийх үү"}}
+    asyncio.run(bot.handle_messaging_event(event))
+    assert secrets_and_stubs == [] and len(owner["notify"]) == 1
+    assert bot.AWAITING_PAYMENT_SCREENSHOT["555"] == ORDER
 
 
 def test_customer_contact_reads_name_from_the_conversation(monkeypatch):
