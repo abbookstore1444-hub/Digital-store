@@ -1532,7 +1532,7 @@ def shop_facts() -> str:
         + "\n".join(lines or ["(одоогоор байхгүй)"])
         + f"\n\nХэрхэн авах вэ: цэснээс бүтээгдэхүүнээ сонгоод «{BUY_BUTTON_TEXT}» дарна, {pay}. "
         "Төлбөр баталгаажмагц PDF болон Excel файлын Google Drive татах холбоос энэ чатад шууд ирнэ."
-        "\n\nБуцаалт: цахим бүтээгдэхүүн тул төлбөрийг буцаан олгохгүй, солихгүй."
+        "\n\nБуцаалт: цахим бүтээгдэхүүн тул төлбөрийг буцаан олгох боломжгүй байна."
     )
     if SHOP_INFO_TEXT:
         facts += "\n\n" + SHOP_INFO_TEXT
@@ -1556,8 +1556,9 @@ async def gemini_reply(sender_id: str, text: str, situation: str = "", quick_rep
         "they are buying a printed book. If asked about delivery, a printed copy or shipping, say it is a "
         "digital file sent here as a download link right after payment.\n"
         "Use ONLY the shop facts below. Never invent products, prices, discounts, deadlines or promises.\n"
-        "There are NO refunds or exchanges: if asked, say politely that payment is not refunded because "
-        "the product is a digital file. Never offer or promise a refund.\n"
+        "There are NO refunds. Mention this ONLY when the customer asks about a refund or getting their "
+        "money back; then reply with the «Буцаалт» sentence from the facts, politely. Never offer or "
+        "promise a refund.\n"
         "Set needs_owner=true if the facts don't answer the message, or it is a complaint, a "
         "problem with a payment or download, or personal; still reply politely with what the facts do "
         "cover. Never say that the owner, a person or anyone else will reply or join the chat.\n"
