@@ -892,6 +892,9 @@ AWAITING_NAME: set[str] = set()
 # so the same receipt can't pay for a second order. In-memory, like the
 # rest, so it only covers the time since the last restart.
 USED_RECEIPTS: set[str] = set()
+# How many screenshots per order the bot has turned down by itself (see
+# MAX_CUSTOMER_RETRIES).
+CUSTOMER_RETRIES: dict[str, int] = {}
 
 # Facebook's Messenger platform can (and sometimes does) deliver the same
 # webhook event more than once -- it's a documented at-least-once
@@ -1650,44 +1653,67 @@ def name_matches(seen: str | None, expected: str) -> bool:
     return len(a) >= 3 and bool(b) and (a in b or b in a)
 
 
-def judge_receipt(info: dict, product: "Product", image_hash: str, now: datetime | None = None) -> tuple[bool, str]:
+RECEIPT_RETRY_HINT = "\n\nТөлбөрөө шалгаад, шилжүүлгийн баримтын зургаа дахин илгээнэ үү."
+# After this many screenshots for one order that the bot turned down
+# itself, the next one goes to the owner instead, in case Gemini keeps
+# misreading a genuine receipt.
+MAX_CUSTOMER_RETRIES = int(os.environ.get("MAX_CUSTOMER_RETRIES", "2"))
+
+
+def judge_receipt(info: dict, product: "Product", image_hash: str, now: datetime | None = None) -> tuple[bool, str, str]:
     """Decides whether a screenshot, as read by Gemini, proves payment for
-    `product`. Returns (accepted, reason in Mongolian for the owner).
-    Anything doubtful is not accepted, so it goes to the owner instead."""
+    `product`. Returns (accepted, reason in Mongolian for the owner, text
+    for the customer). A clear, fixable problem -- not a receipt, wrong
+    amount or account, an old date -- comes with customer text, so the bot
+    asks for a correct screenshot itself. Suspicious or unclear cases have
+    no customer text and go to the owner."""
+    def deny(reason: str, tell: str) -> tuple[bool, str, str]:
+        return False, reason, tell + RECEIPT_RETRY_HINT
+
     if not BANK_ACCOUNT_NUMBER and not BANK_ACCOUNT_NAME:
-        return False, "BANK_ACCOUNT_NUMBER тохируулаагүй тул автоматаар шалгах боломжгүй"
+        return False, "BANK_ACCOUNT_NUMBER тохируулаагүй тул автоматаар шалгах боломжгүй", ""
     if not info.get("is_payment_receipt"):
-        return False, "Төлбөрийн баримт биш зураг"
-    if not info.get("transfer_successful"):
-        return False, "Гүйлгээ амжилттай болсон нь харагдахгүй байна"
+        return deny("Төлбөрийн баримт биш зураг",
+                    "Илгээсэн зураг төлбөрийн баримт биш байна. Дүн, хүлээн авагчийн данс харагдах "
+                    "шилжүүлгийн баримтын зураг хэрэгтэй.")
     if info.get("looks_edited"):
-        return False, "Зураг засварласан байж магадгүй"
+        return False, "Зураг засварласан байж магадгүй", ""
+    if not info.get("transfer_successful"):
+        return deny("Гүйлгээ амжилттай болсон нь харагдахгүй байна",
+                    "Баримт дээр гүйлгээ амжилттай болсон нь харагдахгүй байна.")
     amount = info.get("amount")
-    if not isinstance(amount, (int, float)) or amount < product.amount:
-        return False, f"Дүн {amount}₮, хүлээгдэж буй {product.amount:.0f}₮"
+    if not isinstance(amount, (int, float)):
+        return deny("Дүн харагдахгүй байна", "Баримт дээр шилжүүлсэн дүн харагдахгүй байна.")
+    if amount < product.amount:
+        return deny(f"Дүн {amount:.0f}₮, хүлээгдэж буй {product.amount:.0f}₮",
+                    f"Шилжүүлсэн дүн {amount:.0f}₮ байна, үнэ нь {product.amount:.0f}₮.")
     account, name = info.get("recipient_account"), info.get("recipient_name")
     if BANK_ACCOUNT_NUMBER and account:
         if not account_matches(account, BANK_ACCOUNT_NUMBER):
-            return False, f"Хүлээн авагчийн данс таарахгүй: {account}"
+            return deny(f"Хүлээн авагчийн данс таарахгүй: {account}",
+                        "Хүлээн авагчийн данс манай данстай таарахгүй байна. Төлбөрийн мэдээллээ шалгана уу.")
     elif BANK_ACCOUNT_NAME and name:
         if not name_matches(name, BANK_ACCOUNT_NAME):
-            return False, f"Хүлээн авагчийн нэр таарахгүй: {name}"
+            return deny(f"Хүлээн авагчийн нэр таарахгүй: {name}",
+                        "Хүлээн авагчийн нэр манай данстай таарахгүй байна. Төлбөрийн мэдээллээ шалгана уу.")
     else:
-        return False, "Хүлээн авагчийн данс, нэр харагдахгүй байна"
+        return deny("Хүлээн авагчийн данс, нэр харагдахгүй байна",
+                    "Баримт дээр хүлээн авагчийн данс эсвэл нэр харагдахгүй байна. Бүтэн харагдах зураг хэрэгтэй.")
     date_text = info.get("transfer_date")
     if date_text:
         try:
             day = datetime.strptime(re.sub(r"[./]", "-", date_text)[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
         except ValueError:
-            return False, f"Огноо уншигдсангүй: {date_text}"
+            return False, f"Огноо уншигдсангүй: {date_text}", ""
         now = now or datetime.now(timezone.utc)
         # A day of slack each way for time zones (Mongolia is UTC+8).
         if day > now + timedelta(days=1) or now - day > timedelta(days=RECEIPT_MAX_AGE_DAYS + 1):
-            return False, f"Гүйлгээний огноо {date_text}"
+            return deny(f"Гүйлгээний огноо {date_text}",
+                        f"Баримтын огноо ({date_text}) энэ захиалгынх биш байна.")
     ref = str(info.get("transaction_reference") or "").strip()
     if image_hash in USED_RECEIPTS or (ref and f"ref:{ref}" in USED_RECEIPTS):
-        return False, "Энэ баримтыг өмнө нь өөр захиалгад ашигласан"
-    return True, "OK"
+        return False, "Энэ баримтыг өмнө нь өөр захиалгад ашигласан", ""
+    return True, "OK", ""
 
 
 def first_photo_url(attachments: list[dict]) -> str | None:
@@ -1716,8 +1742,10 @@ def order_record(order_id: str) -> dict | None:
 async def handle_payment_photo(sender_id: str, order_id: str, attachments: list[dict]) -> None:
     """Manual mode: a customer sent a photo for a pending order. The
     screenshot is delivered automatically only if Gemini reads it as the
-    right payment; otherwise the owner gets it in Telegram with Approve /
-    Reject buttons, and the customer hears nothing until then. Without
+    right payment. If it clearly isn't (not a receipt, wrong amount or
+    account...), the customer is told what's wrong and asked for another.
+    Anything suspicious or unclear goes to the owner in Telegram with
+    Approve / Reject buttons, and the customer hears nothing until then. Without
     Telegram there's nobody to ask, so any photo counts as payment, as
     before this check existed."""
     if not telegram_enabled():
@@ -1727,7 +1755,7 @@ async def handle_payment_photo(sender_id: str, order_id: str, attachments: list[
     record = order_record(order_id)
     product = next((p for p in PRODUCTS if record and p.index == record.get("product_index")), None)
     photo, info, image_hash = None, {}, ""
-    accepted, reason = False, ""
+    accepted, reason, tell_customer = False, "", ""
     try:
         url = first_photo_url(attachments)
         if not url:
@@ -1746,7 +1774,7 @@ async def handle_payment_photo(sender_id: str, order_id: str, attachments: list[
                 ],
                 RECEIPT_SCHEMA,
             )
-            accepted, reason = judge_receipt(info, product, image_hash)
+            accepted, reason, tell_customer = judge_receipt(info, product, image_hash)
     except Exception as e:
         reason = f"Автоматаар шалгаж чадсангүй ({type(e).__name__})"
         logger.warning("Screenshot check failed for order %s: %s", order_id, e)
@@ -1758,6 +1786,18 @@ async def handle_payment_photo(sender_id: str, order_id: str, attachments: list[
             USED_RECEIPTS.add(f"ref:{ref}")
         logger.info("Screenshot for order %s accepted automatically", order_id)
         await fulfill_manual_order(order_id)
+        return
+
+    # A clear, fixable problem: tell the customer and wait for another
+    # screenshot. After MAX_CUSTOMER_RETRIES of these, the owner decides.
+    if tell_customer and CUSTOMER_RETRIES.get(order_id, 0) < MAX_CUSTOMER_RETRIES:
+        CUSTOMER_RETRIES[order_id] = CUSTOMER_RETRIES.get(order_id, 0) + 1
+        AWAITING_PAYMENT_SCREENSHOT[sender_id] = order_id
+        logger.info("Screenshot for order %s turned down (%s), customer asked again", order_id, reason)
+        await send_meta_message(
+            {"id": sender_id},
+            {"text": tell_customer, "quick_replies": awaiting_payment_quick_replies()},
+        )
         return
 
     logger.info("Screenshot for order %s sent to the owner: %s", order_id, reason)

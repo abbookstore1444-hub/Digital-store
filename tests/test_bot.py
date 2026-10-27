@@ -178,6 +178,7 @@ def bank(monkeypatch):
     monkeypatch.setattr(bot, "BANK_ACCOUNT_NUMBER", "5123456789")
     monkeypatch.setattr(bot, "BANK_ACCOUNT_NAME", "")
     bot.USED_RECEIPTS.clear()
+    bot.CUSTOMER_RETRIES.clear()
 
 
 @pytest.fixture
@@ -233,22 +234,29 @@ def photo_event(mid="p1"):
 
 
 def test_judge_receipt_accepts_the_right_payment(bank):
-    assert bot.judge_receipt(GOOD_RECEIPT, PRODUCT, "img:1", now=NOW) == (True, "OK")
+    assert bot.judge_receipt(GOOD_RECEIPT, PRODUCT, "img:1", now=NOW) == (True, "OK", "")
 
 
-@pytest.mark.parametrize("change", [
-    {"amount": 10000},
-    {"amount": None},
-    {"recipient_account": "5999999999"},
-    {"is_payment_receipt": False},
-    {"transfer_successful": False},
-    {"looks_edited": True},
-    {"recipient_account": None, "recipient_name": None},
-    {"transfer_date": "2026-10-01"},
+@pytest.mark.parametrize("change,tells_customer", [
+    ({"amount": 10000}, True),
+    ({"amount": None}, True),
+    ({"recipient_account": "5999999999"}, True),
+    ({"is_payment_receipt": False}, True),
+    ({"transfer_successful": False}, True),
+    ({"looks_edited": True}, False),
+    ({"recipient_account": None, "recipient_name": None}, True),
+    ({"transfer_date": "2026-10-01"}, True),
 ])
-def test_judge_receipt_rejects_doubtful_screenshots(bank, change):
-    accepted, reason = bot.judge_receipt({**GOOD_RECEIPT, **change}, PRODUCT, "img:1", now=NOW)
+def test_judge_receipt_rejects_doubtful_screenshots(bank, change, tells_customer):
+    accepted, reason, tell = bot.judge_receipt({**GOOD_RECEIPT, **change}, PRODUCT, "img:1", now=NOW)
     assert not accepted and reason
+    assert bool(tell) is tells_customer
+
+
+def test_reused_receipt_goes_to_the_owner_not_the_customer(bank):
+    bot.USED_RECEIPTS.add("img:1")
+    accepted, _, tell = bot.judge_receipt(GOOD_RECEIPT, PRODUCT, "img:1", now=NOW)
+    assert not accepted and tell == ""
 
 
 def test_judge_receipt_rejects_a_reused_receipt(bank):
@@ -278,13 +286,33 @@ def test_good_screenshot_is_delivered_without_the_owner(secrets_and_stubs, owner
     assert "ref:TX1" in bot.USED_RECEIPTS
 
 
-def test_doubtful_screenshot_goes_to_the_owner(secrets_and_stubs, owner, monkeypatch):
+def test_wrong_amount_is_explained_to_the_customer(secrets_and_stubs, owner, monkeypatch):
     gemini_returns(monkeypatch, {**GOOD_RECEIPT, "amount": 5000, "transfer_date": None})
+    bot.AWAITING_PAYMENT_SCREENSHOT["555"] = ORDER
+    asyncio.run(bot.handle_messaging_event(photo_event()))
+    assert owner["delivered"] == [] and owner["notify"] == []
+    _, message = secrets_and_stubs[-1]
+    assert "5000₮" in message["text"] and "15000₮" in message["text"]
+    assert [q["payload"] for q in message["quick_replies"]] == ["CANCEL_ORDER", "VIEW_MENU"]
+    assert bot.AWAITING_PAYMENT_SCREENSHOT["555"] == ORDER  # waiting for a new screenshot
+
+
+def test_owner_decides_after_repeated_wrong_screenshots(secrets_and_stubs, owner, monkeypatch):
+    gemini_returns(monkeypatch, {**GOOD_RECEIPT, "amount": 5000, "transfer_date": None})
+    for i in range(bot.MAX_CUSTOMER_RETRIES + 1):
+        bot.AWAITING_PAYMENT_SCREENSHOT["555"] = ORDER
+        asyncio.run(bot.handle_messaging_event(photo_event(mid=f"r{i}")))
+    assert len(secrets_and_stubs) == bot.MAX_CUSTOMER_RETRIES and len(owner["notify"]) == 1
+    assert "5000" in owner["notify"][0][0]
+
+
+def test_suspicious_screenshot_goes_to_the_owner(secrets_and_stubs, owner, monkeypatch):
+    gemini_returns(monkeypatch, {**GOOD_RECEIPT, "looks_edited": True, "transfer_date": None})
     bot.AWAITING_PAYMENT_SCREENSHOT["555"] = ORDER
     asyncio.run(bot.handle_messaging_event(photo_event()))
     assert owner["delivered"] == []
     text, photo, buttons = owner["notify"][0]
-    assert "5000" in text and photo == (b"image-bytes", "image/jpeg")
+    assert "засварласан" in text and photo == (b"image-bytes", "image/jpeg")
     assert "Болор Цэцэг" in text and "https://inbox/555" in text
     assert [b["callback_data"] for b in buttons["inline_keyboard"][0]] == [f"pay:ok:{ORDER}", f"pay:no:{ORDER}"]
     assert secrets_and_stubs == []  # the customer hears nothing until it's approved
