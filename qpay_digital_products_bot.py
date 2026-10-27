@@ -438,10 +438,9 @@ BANK_ACCOUNT_NUMBER = re.sub(r"\D", "", os.environ.get("BANK_ACCOUNT_NUMBER", ""
 BANK_ACCOUNT_NAME = os.environ.get("BANK_ACCOUNT_NAME", "").strip()
 # Screenshots dated older than this go to the owner instead.
 RECEIPT_MAX_AGE_DAYS = float(os.environ.get("RECEIPT_MAX_AGE_DAYS", "3"))
-PAYMENT_UNDER_REVIEW_TEXT = os.environ.get(
-    "PAYMENT_UNDER_REVIEW_TEXT",
-    "\U0001F50E Баярлалаа! Таны төлбөрийг шалгаж байна. Баталгаажмагц файлыг энд илгээнэ.",
-)
+# Optional message to the customer while a screenshot waits for the owner.
+# Empty by default: the customer just gets the link once it's approved.
+PAYMENT_UNDER_REVIEW_TEXT = os.environ.get("PAYMENT_UNDER_REVIEW_TEXT", "")
 PAYMENT_REJECTED_TEXT = os.environ.get(
     "PAYMENT_REJECTED_TEXT",
     "Уучлаарай, төлбөр баталгаажсангүй. Шилжүүлгийн дүн, данс зөв эсэхийг шалгаад "
@@ -1718,7 +1717,7 @@ async def handle_payment_photo(sender_id: str, order_id: str, attachments: list[
     """Manual mode: a customer sent a photo for a pending order. The
     screenshot is delivered automatically only if Gemini reads it as the
     right payment; otherwise the owner gets it in Telegram with Approve /
-    Reject buttons, and the customer is told it's being checked. Without
+    Reject buttons, and the customer hears nothing until then. Without
     Telegram there's nobody to ask, so any photo counts as payment, as
     before this check existed."""
     if not telegram_enabled():
@@ -1762,7 +1761,8 @@ async def handle_payment_photo(sender_id: str, order_id: str, attachments: list[
         return
 
     logger.info("Screenshot for order %s sent to the owner: %s", order_id, reason)
-    await send_meta_message({"id": sender_id}, {"text": PAYMENT_UNDER_REVIEW_TEXT})
+    if PAYMENT_UNDER_REVIEW_TEXT:
+        await send_meta_message({"id": sender_id}, {"text": PAYMENT_UNDER_REVIEW_TEXT})
     what = f"{product.description} -- {product.amount:.0f}₮" if product else "?"
     name, link = await customer_contact(sender_id)
     await notify_owner(

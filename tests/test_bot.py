@@ -287,7 +287,7 @@ def test_doubtful_screenshot_goes_to_the_owner(secrets_and_stubs, owner, monkeyp
     assert "5000" in text and photo == (b"image-bytes", "image/jpeg")
     assert "Болор Цэцэг" in text and "https://inbox/555" in text
     assert [b["callback_data"] for b in buttons["inline_keyboard"][0]] == [f"pay:ok:{ORDER}", f"pay:no:{ORDER}"]
-    assert secrets_and_stubs[-1][1]["text"] == bot.PAYMENT_UNDER_REVIEW_TEXT
+    assert secrets_and_stubs == []  # the customer hears nothing until it's approved
 
 
 def test_gemini_failure_sends_screenshot_to_the_owner(secrets_and_stubs, owner, monkeypatch):
