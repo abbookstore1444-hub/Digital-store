@@ -2243,6 +2243,17 @@ async def handle_messaging_event(event: dict) -> None:
             AWAITING_NAME.add(sender_id)
         return
 
+    # A customer who already has a conversation with the Page and then
+    # clicks a Click-to-Messenger ad sends only a "referral" event -- no
+    # text, no postback. Without this they'd get silence until they type.
+    # (Needs the messaging_referrals webhook field on the Meta app.)
+    if event.get("referral") and not event.get("message"):
+        if sender_id in AWAITING_PAYMENT_SCREENSHOT or sender_id in AWAITING_EMAIL:
+            return
+        await send_meta_message({"id": sender_id}, {"text": WELCOME_TEXT})
+        await send_category_menu(sender_id)
+        return
+
     # Not a postback.
     message = event.get("message", {})
 

@@ -487,6 +487,22 @@ def test_ok_during_payment_is_reminded_only_once(secrets_and_stubs, owner, monke
     assert bot.AWAITING_PAYMENT_SCREENSHOT["555"] == ORDER
 
 
+def test_ad_click_from_a_returning_customer_gets_welcome_and_product(secrets_and_stubs, owner):
+    event = {"sender": {"id": "800"}, "timestamp": 30,
+             "referral": {"source": "ADS", "type": "OPEN_THREAD", "ad_id": "123"}}
+    asyncio.run(bot.handle_messaging_event(event))
+    assert secrets_and_stubs[-1][1] == {"text": bot.WELCOME_TEXT}
+    assert owner["menu"] == ["800"]
+
+
+def test_ad_click_during_payment_does_not_reset_the_order(secrets_and_stubs, owner):
+    bot.AWAITING_PAYMENT_SCREENSHOT["555"] = ORDER
+    event = {"sender": {"id": "555"}, "timestamp": 31, "referral": {"source": "ADS", "ad_id": "123"}}
+    asyncio.run(bot.handle_messaging_event(event))
+    assert secrets_and_stubs == [] and owner["menu"] == []
+    assert bot.AWAITING_PAYMENT_SCREENSHOT["555"] == ORDER
+
+
 def test_gemini_failure_falls_back_to_the_fixed_reply(secrets_and_stubs, owner, monkeypatch):
     gemini_returns(monkeypatch, bot.GeminiError("busy"))
     asyncio.run(bot.process_text_messages("700", ["hi"]))
