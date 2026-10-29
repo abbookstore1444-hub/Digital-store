@@ -289,6 +289,17 @@ def test_account_matches(seen, ok):
     assert bot.account_matches(seen, "5123456789") is ok
 
 
+@pytest.mark.parametrize("seen,ok", [
+    ("5123 456 789", True),                # same-bank transfer: plain account only
+    ("MN12 0005 0051 2345 6789", True),    # transfer from another bank: IBAN
+    ("****6789", True), ("5123****6789", True),
+    ("5123456780", False), ("MN12 0005 0051 2345 6780", False), ("9999****6789", False),
+])
+def test_account_matches_when_the_setting_is_an_iban(seen, ok):
+    # BANK_ACCOUNT_NUMBER keeps only digits, so "MN12 0005 0051 2345 6789" is stored like this
+    assert bot.account_matches(seen, "120005005123456789") is ok
+
+
 def test_good_screenshot_is_delivered_without_the_owner(secrets_and_stubs, owner, monkeypatch):
     gemini_returns(monkeypatch, {**GOOD_RECEIPT, "transfer_date": None})
     bot.AWAITING_PAYMENT_SCREENSHOT["555"] = ORDER

@@ -1669,21 +1669,32 @@ RECEIPT_PROMPT = (
 )
 
 
+def account_forms(digits: str) -> set[str]:
+    """The account number itself plus, for a Mongolian IBAN (MNkk, a 4-digit
+    bank code, then the account padded to 12 digits), the bare account."""
+    forms = {digits}
+    if len(digits) > 12:
+        forms.add(digits[-12:].lstrip("0"))
+    return {f for f in forms if f}
+
+
 def account_matches(seen: str | None, expected: str) -> bool:
-    """True if the account on the receipt is `expected`. Banks often mask
-    part of it (5123****89), so a masked number matches on its visible
-    digits: the last group (3+ digits) must end `expected` and a leading
-    group must start it. An IBAN (MN12 0005 ...) ends with the account."""
+    """True if the account on the receipt is `expected`. Either side may be
+    an IBAN (MN12 0005 ...) or the plain account: a transfer within the same
+    bank usually shows only the account, one from another bank the IBAN.
+    Banks often mask part of it (5123****89), so a masked number matches on
+    its visible digits: the last group (3+ digits) must end the account and
+    a leading group must start it."""
     s = re.sub(r"[\s\-]", "", seen or "")
     groups = re.findall(r"\d+", s)
     if not expected or not groups:
         return False
+    wanted = account_forms(expected)
     if re.fullmatch(r"([A-Za-z]{2})?\d+", s):
-        return re.sub(r"\D", "", s).endswith(expected)
-    return (
-        len(groups[-1]) >= 3
-        and expected.endswith(groups[-1])
-        and (not s[0].isdigit() or expected.startswith(groups[0]))
+        return bool(account_forms(re.sub(r"\D", "", s)) & wanted)
+    return len(groups[-1]) >= 3 and any(
+        e.endswith(groups[-1]) and (not s[0].isdigit() or e.startswith(groups[0]))
+        for e in wanted
     )
 
 
