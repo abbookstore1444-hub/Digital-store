@@ -532,3 +532,17 @@ def test_error_logs_reach_the_owner_once(owner):
 
     asyncio.run(run())
     assert len(owner["notify"]) == 1 and "Delivery failed" in owner["notify"][0][0]
+
+
+def test_meta_calls_wait_longer_than_httpx_default(monkeypatch):
+    # Meta can take more than httpx's 5-second default to post a reply.
+    seen = {}
+    real_client = bot.httpx.AsyncClient
+
+    def client(*a, **k):
+        seen.update(k)
+        return real_client(transport=bot.httpx.MockTransport(lambda req: bot.httpx.Response(200, json={"id": "1"})))
+
+    monkeypatch.setattr(bot.httpx, "AsyncClient", client)
+    asyncio.run(bot.reply_to_comment("c1", "hi"))
+    assert seen["timeout"].read >= 15

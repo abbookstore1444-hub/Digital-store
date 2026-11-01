@@ -207,6 +207,10 @@ META_APP_SECRET = os.environ.get("META_APP_SECRET", "")
 PAGE_ID = ""
 GRAPH_API_VERSION = "v25.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
+# httpx's default is 5 seconds, and Meta sometimes takes longer to post a
+# comment reply or private reply (seen 2026-11-01: ReadTimeout during the
+# boost, so a commenter's Buy button failed).
+META_TIMEOUT = httpx.Timeout(20.0)
 
 
 def graph_params() -> dict:
@@ -806,7 +810,7 @@ async def get_customer_name(psid: str) -> str:
     url = f"{GRAPH_API_BASE}/{psid}"
     params = {"fields": "first_name,last_name"}
     try:
-        async with httpx.AsyncClient() as http_client:
+        async with httpx.AsyncClient(timeout=META_TIMEOUT) as http_client:
             resp = await http_client.get(url, params={**params, **graph_params()})
             data = resp.json()
 
@@ -1006,7 +1010,7 @@ async def send_meta_message(recipient: dict, message: dict) -> None:
         await asyncio.sleep(REPLY_DELAY_SECONDS)
     url = f"{GRAPH_API_BASE}/me/messages"
     payload = {"recipient": recipient, "message": message, "messaging_type": "RESPONSE"}
-    async with httpx.AsyncClient() as http_client:
+    async with httpx.AsyncClient(timeout=META_TIMEOUT) as http_client:
         resp = await http_client.post(url, params=graph_params(), json=payload)
         # Body only on errors: successful responses just echo IDs.
         if resp.is_error:
@@ -1199,7 +1203,7 @@ async def setup_messenger_profile() -> None:
             }
         ],
     }
-    async with httpx.AsyncClient() as http_client:
+    async with httpx.AsyncClient(timeout=META_TIMEOUT) as http_client:
         resp = await http_client.post(url, params=graph_params(), json=payload)
         logger.info("Messenger profile setup response: %s %s", resp.status_code, resp.text)
         raise_for_graph_error(resp)
@@ -1207,14 +1211,14 @@ async def setup_messenger_profile() -> None:
 
 async def like_comment(comment_id: str) -> None:
     url = f"{GRAPH_API_BASE}/{comment_id}/likes"
-    async with httpx.AsyncClient() as http_client:
+    async with httpx.AsyncClient(timeout=META_TIMEOUT) as http_client:
         resp = await http_client.post(url, params=graph_params())
         raise_for_graph_error(resp)
 
 
 async def reply_to_comment(comment_id: str, message: str) -> None:
     url = f"{GRAPH_API_BASE}/{comment_id}/comments"
-    async with httpx.AsyncClient() as http_client:
+    async with httpx.AsyncClient(timeout=META_TIMEOUT) as http_client:
         resp = await http_client.post(url, params=graph_params(), json={"message": message})
         raise_for_graph_error(resp)
 
@@ -2106,11 +2110,12 @@ async def handle_feed_change(value: dict, page_id: str | None = None) -> None:
         try:
             await like_comment(comment_id)
         except Exception as e:
-            logger.warning("Failed to like comment %s: %s", comment_id, e)
+            logger.warning("Failed to like comment %s: %r", comment_id, e)
         try:
             await reply_to_comment(comment_id, COMMENT_REPLY_TEXT)
         except Exception as e:
-            logger.warning("Failed to reply to comment %s: %s", comment_id, e)
+            # %r: a timeout's message is empty, so %s logged nothing useful
+            logger.warning("Failed to reply to comment %s: %r", comment_id, e)
 
     if not product:
         if FALLBACK_REPLY_TEXT:
