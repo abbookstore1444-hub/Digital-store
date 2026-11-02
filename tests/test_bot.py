@@ -237,7 +237,7 @@ def owner(monkeypatch, bank):
 
 
 def gemini_returns(monkeypatch, result):
-    async def fake_gemini(parts, schema, timeout=None):
+    async def fake_gemini(parts, schema, timeout=None, fast=False):
         if isinstance(result, Exception):
             raise result
         return result
@@ -412,7 +412,7 @@ def test_question_gemini_cannot_answer_reaches_the_owner(secrets_and_stubs, owne
 def test_gemini_is_told_not_to_promise_the_owner(secrets_and_stubs, owner, monkeypatch):
     seen = {}
 
-    async def fake_gemini(parts, schema, timeout=None):
+    async def fake_gemini(parts, schema, timeout=None, fast=False):
         seen["prompt"] = parts[0]["text"]
         return {"reply": "OK", "needs_owner": False, "product_index": None}
 
@@ -451,7 +451,7 @@ def test_question_about_a_product_shows_its_buy_button(secrets_and_stubs, owner,
 def test_question_during_payment_gets_a_gemini_answer(secrets_and_stubs, owner, monkeypatch):
     seen = {}
 
-    async def fake_gemini(parts, schema, timeout=None):
+    async def fake_gemini(parts, schema, timeout=None, fast=False):
         seen["prompt"] = parts[0]["text"]
         return {"reply": "Excel-ийн томъёо заадаг. Төлбөрөө хийгээд зургаа илгээнэ үү.", "needs_owner": False, "product_index": 1}
 
@@ -479,7 +479,7 @@ def test_question_during_payment_falls_back_to_the_reminder(secrets_and_stubs, o
 def test_small_talk_gets_one_line_and_no_menu(secrets_and_stubs, owner, monkeypatch):
     seen = {}
 
-    async def fake_gemini(parts, schema, timeout=None):
+    async def fake_gemini(parts, schema, timeout=None, fast=False):
         seen["prompt"] = parts[0]["text"]
         return {"reply": "Баярлалаа! 😊", "needs_owner": False, "small_talk": True, "product_index": None}
 
@@ -568,7 +568,7 @@ def chat(owner, monkeypatch):
 def test_chat_mode_reply_has_no_buy_button(secrets_and_stubs, chat, monkeypatch):
     seen = {}
 
-    async def fake_gemini(parts, schema, timeout=None):
+    async def fake_gemini(parts, schema, timeout=None, fast=False):
         seen["prompt"] = parts[0]["text"]
         return {"reply": "Сайн байна уу! Excel-ийг юунд ашиглах гэж байгаа вэ?", "needs_owner": False,
                 "small_talk": False, "product_index": 1, "wants_to_buy": False}
@@ -620,7 +620,7 @@ def test_chat_mode_accepts_a_screenshot_without_a_buy_step(secrets_and_stubs, ch
 def test_chat_mode_remembers_the_conversation(secrets_and_stubs, chat, monkeypatch):
     prompts = []
 
-    async def fake_gemini(parts, schema, timeout=None):
+    async def fake_gemini(parts, schema, timeout=None, fast=False):
         prompts.append(parts[0]["text"])
         return {"reply": f"хариу {len(prompts)}", "needs_owner": False, "small_talk": False,
                 "product_index": None, "wants_to_buy": False}
@@ -666,7 +666,7 @@ def test_chat_mode_first_reply_keeps_its_greeting(secrets_and_stubs, chat, monke
 def test_chat_mode_answers_one_message_at_a_time(secrets_and_stubs, chat, monkeypatch):
     prompts = []
 
-    async def slow_gemini(parts, schema, timeout=None):
+    async def slow_gemini(parts, schema, timeout=None, fast=False):
         prompts.append(parts[0]["text"])
         await asyncio.sleep(0.05)
         return {"reply": f"хариу {len(prompts)}", "needs_owner": False, "small_talk": False,
@@ -680,3 +680,51 @@ def test_chat_mode_answers_one_message_at_a_time(secrets_and_stubs, chat, monkey
 
     asyncio.run(two_messages())
     assert "Shop: хариу 1" in prompts[1]  # the second waited for the first reply
+
+
+def fake_gemini_server(monkeypatch, handler):
+    """Routes gemini_json's HTTP calls to `handler`; returns the requests seen."""
+    calls = []
+    real_client = bot.httpx.AsyncClient
+
+    def wrapped(request):
+        calls.append((request.url.path.rsplit("/", 1)[-1], json.loads(request.content)))
+        return handler(request, len(calls))
+
+    monkeypatch.setattr(bot.httpx, "AsyncClient", lambda *a, **k: real_client(transport=bot.httpx.MockTransport(wrapped)))
+    monkeypatch.setattr(bot, "GEMINI_API_KEY", "k")
+    monkeypatch.setattr(bot, "GEMINI_MODELS", ["gemini-3.5-flash-lite", "gemini-3.6-flash"])
+    return calls
+
+
+def gemini_ok(data):
+    return bot.httpx.Response(200, json={"candidates": [{"content": {"parts": [{"text": json.dumps(data)}]}}]})
+
+
+def test_gemini_timeout_moves_straight_to_the_next_model(monkeypatch):
+    def handler(request, n):
+        if "flash-lite" in request.url.path:
+            raise bot.httpx.ReadTimeout("slow", request=request)
+        return gemini_ok({"reply": "ok"})
+
+    calls = fake_gemini_server(monkeypatch, handler)
+    assert asyncio.run(bot.gemini_json([{"text": "hi"}], bot.ANSWER_SCHEMA, timeout=1)) == {"reply": "ok"}
+    assert [model for model, _ in calls] == ["gemini-3.5-flash-lite:generateContent", "gemini-3.6-flash:generateContent"]
+
+
+def test_fast_gemini_keeps_thinking_short_and_drops_it_if_rejected(monkeypatch):
+    def handler(request, n):
+        if "thinkingConfig" in json.loads(request.content)["generationConfig"]:
+            return bot.httpx.Response(400, json={"error": {"message": "unknown field"}})
+        return gemini_ok({"reply": "ok"})
+
+    calls = fake_gemini_server(monkeypatch, handler)
+    assert asyncio.run(bot.gemini_json([{"text": "hi"}], bot.ANSWER_SCHEMA, fast=True)) == {"reply": "ok"}
+    assert calls[0][1]["generationConfig"]["thinkingConfig"] == {"thinkingLevel": "low"}
+    assert "thinkingConfig" not in calls[1][1]["generationConfig"] and len(calls) == 2
+
+
+def test_screenshot_checks_keep_full_thinking(monkeypatch):
+    calls = fake_gemini_server(monkeypatch, lambda request, n: gemini_ok({"reply": "ok"}))
+    asyncio.run(bot.gemini_json([{"text": "hi"}], bot.ANSWER_SCHEMA))
+    assert "thinkingConfig" not in calls[0][1]["generationConfig"]

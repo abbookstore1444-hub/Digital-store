@@ -1549,31 +1549,46 @@ class GeminiError(Exception):
     pass
 
 
-async def gemini_json(parts: list[dict], schema: dict, timeout: float = 45) -> dict:
+def quick_thinking(model: str) -> dict | None:
+    """Keeps a model's thinking short, for chat replies. Thinking models
+    think at length by default, which made replies take 15+ seconds."""
+    if model.startswith("gemini-2.5-flash"):
+        return {"thinkingBudget": 0}
+    if model.startswith("gemini-3"):
+        return {"thinkingLevel": "low"}
+    return None
+
+
+async def gemini_json(parts: list[dict], schema: dict, timeout: float = 45, fast: bool = False) -> dict:
     """Asks Gemini for JSON matching `schema`, trying GEMINI_MODELS in turn.
     `timeout` is per try: a short one moves on to the next model quickly
     when Google is slow, which matters while a customer waits for a reply.
+    `fast` keeps thinking short (see quick_thinking).
     The key goes in a header, not the URL, so it can't appear in logs."""
     last_problem = "no models configured"
     async with httpx.AsyncClient(timeout=timeout) as http_client:
         for model in GEMINI_MODELS:
+            thinking = quick_thinking(model) if fast else None
             for attempt in range(2):
+                config = {"responseMimeType": "application/json", "responseSchema": schema, "temperature": 0.2}
+                if thinking:
+                    config["thinkingConfig"] = thinking
                 try:
                     resp = await http_client.post(
                         f"{GEMINI_API_BASE}/{model}:generateContent",
                         headers={"x-goog-api-key": GEMINI_API_KEY},
-                        json={
-                            "contents": [{"role": "user", "parts": parts}],
-                            "generationConfig": {
-                                "responseMimeType": "application/json",
-                                "responseSchema": schema,
-                                "temperature": 0.2,
-                            },
-                        },
+                        json={"contents": [{"role": "user", "parts": parts}], "generationConfig": config},
                     )
                 except httpx.HTTPError as e:
                     last_problem = f"{model}: {type(e).__name__}"
                     logger.warning("Gemini try failed: %s", last_problem)
+                    if isinstance(e, httpx.TimeoutException):
+                        break  # too slow right now: the next model, not the same one again
+                    continue
+                if resp.status_code == 400 and thinking:
+                    # This model doesn't take that thinking setting: ask it normally.
+                    logger.warning("Gemini %s rejected thinkingConfig %s; retrying without it", model, thinking)
+                    thinking = None
                     continue
                 if resp.status_code == 200:
                     try:
@@ -1703,7 +1718,7 @@ async def gemini_reply(
     )
     await send_typing(sender_id)
     try:
-        result = await gemini_json([{"text": prompt}], ANSWER_SCHEMA, timeout=15)
+        result = await gemini_json([{"text": prompt}], ANSWER_SCHEMA, timeout=15, fast=True)
     except GeminiError as e:
         logger.warning("Gemini could not answer a customer message: %s", e)
         return None
