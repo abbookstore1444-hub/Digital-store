@@ -1048,6 +1048,19 @@ async def send_meta_message(recipient: dict, message: dict) -> None:
         raise_for_graph_error(resp)
 
 
+async def send_typing(psid: str) -> None:
+    """Shows the "typing..." dots while Gemini works on a reply (they go
+    away when the reply arrives, or after about 20 seconds). Best effort."""
+    try:
+        async with httpx.AsyncClient(timeout=META_TIMEOUT) as http_client:
+            await http_client.post(
+                f"{GRAPH_API_BASE}/me/messages", params=graph_params(),
+                json={"recipient": {"id": psid}, "sender_action": "typing_on"},
+            )
+    except httpx.HTTPError as e:
+        logger.info("Couldn't show typing for %s: %r", psid, e)
+
+
 def quick_reply(title: str, payload: str) -> dict:
     return {"content_type": "text", "title": title[:20], "payload": payload}
 
@@ -1527,11 +1540,13 @@ class GeminiError(Exception):
     pass
 
 
-async def gemini_json(parts: list[dict], schema: dict) -> dict:
+async def gemini_json(parts: list[dict], schema: dict, timeout: float = 45) -> dict:
     """Asks Gemini for JSON matching `schema`, trying GEMINI_MODELS in turn.
+    `timeout` is per try: a short one moves on to the next model quickly
+    when Google is slow, which matters while a customer waits for a reply.
     The key goes in a header, not the URL, so it can't appear in logs."""
     last_problem = "no models configured"
-    async with httpx.AsyncClient(timeout=45) as http_client:
+    async with httpx.AsyncClient(timeout=timeout) as http_client:
         for model in GEMINI_MODELS:
             for attempt in range(2):
                 try:
@@ -1549,6 +1564,7 @@ async def gemini_json(parts: list[dict], schema: dict) -> dict:
                     )
                 except httpx.HTTPError as e:
                     last_problem = f"{model}: {type(e).__name__}"
+                    logger.warning("Gemini try failed: %s", last_problem)
                     continue
                 if resp.status_code == 200:
                     try:
@@ -1559,6 +1575,7 @@ async def gemini_json(parts: list[dict], schema: dict) -> dict:
                         last_problem = f"{model}: unreadable response"
                         break
                 last_problem = f"{model}: HTTP {resp.status_code}"
+                logger.warning("Gemini try failed: %s", last_problem)
                 if resp.status_code in (429, 500, 503) and attempt == 0:
                     await asyncio.sleep(2)
                     continue
@@ -1675,8 +1692,9 @@ async def gemini_reply(
         )
         + f"CUSTOMER MESSAGE:\n{text[:1500]}"
     )
+    await send_typing(sender_id)
     try:
-        result = await gemini_json([{"text": prompt}], ANSWER_SCHEMA)
+        result = await gemini_json([{"text": prompt}], ANSWER_SCHEMA, timeout=15)
     except GeminiError as e:
         logger.warning("Gemini could not answer a customer message: %s", e)
         return None
