@@ -1669,7 +1669,8 @@ async def gemini_reply(
         f"SHOP FACTS:\n{shop_facts(chat)}\n\n"
         + (f"CUSTOMER'S SITUATION:\n{situation}\n\n" if situation else "")
         + (
-            "CONVERSATION SO FAR (oldest first):\n" + "\n".join(f"{who}: {line}" for who, line in history) + "\n\n"
+            "CONVERSATION SO FAR (oldest first; continue it -- don't greet again or repeat yourself):\n"
+            + "\n".join(f"{who}: {line}" for who, line in history) + "\n\n"
             if history else ""
         )
         + f"CUSTOMER MESSAGE:\n{text[:1500]}"
@@ -2295,6 +2296,12 @@ async def handle_messaging_event(event: dict) -> None:
         payload = postback.get("payload", "")
 
         if payload == "VIEW_PRODUCTS":
+            if chat_mode(sender_id) and chat_product():
+                # The Messenger menu's "products" item: the text, no Buy button.
+                text = build_selected_text(chat_product())
+                await send_meta_message({"id": sender_id}, {"text": text})
+                remember_chat(sender_id, "Shop", text)
+                return
             await send_category_menu(sender_id)
             return
 

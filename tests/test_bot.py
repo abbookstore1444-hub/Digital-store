@@ -632,3 +632,10 @@ def test_chat_mode_comment_gets_the_product_text(secrets_and_stubs, chat, monkey
              "from": {"id": "555", "name": "Test"}}
     asyncio.run(bot.handle_feed_change(value))
     assert secrets_and_stubs == [({"comment_id": "c9"}, {"text": bot.build_selected_text(PRODUCT)})]
+
+
+def test_chat_mode_messenger_menu_shows_the_product_without_a_button(secrets_and_stubs, chat):
+    event = {"sender": {"id": "555"}, "timestamp": 21, "postback": {"payload": "VIEW_PRODUCTS"}}
+    asyncio.run(bot.handle_messaging_event(event))
+    assert [m for _, m in secrets_and_stubs] == [{"text": bot.build_selected_text(PRODUCT)}]
+    assert chat["menu"] == []
