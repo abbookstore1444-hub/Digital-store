@@ -931,6 +931,15 @@ CHAT_HISTORY: dict[str, list[tuple[str, str]]] = {}
 CHAT_HISTORY_LINES = 12
 
 
+# One reply at a time per customer, so a second message waits for the
+# first reply (and sees it in CHAT_HISTORY) instead of racing it.
+CHAT_LOCKS: dict[str, asyncio.Lock] = {}
+GREETING_RE = re.compile(
+    r"^\s*(сайн\s+байна\s+уу|сайн\s+байцгаана\s+уу|сайн\s+уу|мэнд(ээ)?|hello|hi)\b[\s!?.,😊🙂👋]*",
+    re.IGNORECASE,
+)
+
+
 def remember_chat(psid: str, who: str, text: str) -> None:
     lines = CHAT_HISTORY.setdefault(psid, [])
     lines.append((who, text[:600]))
@@ -1705,6 +1714,9 @@ async def gemini_reply(
     if silent_small_talk and result.get("small_talk") and not result.get("needs_owner"):
         return result
     reply = str(result.get("reply") or "").strip()
+    if any(who == "Shop" for who, _ in history):
+        # Mid-conversation: drop a greeting Gemini added anyway.
+        reply = GREETING_RE.sub("", reply, count=1).strip() or reply
     if not reply:
         return None
     message = {"text": reply[:1900]}
@@ -2591,8 +2603,9 @@ async def process_text_messages(sender_id: str, texts: list[str]) -> None:
     # instead of going silent, so the bot doesn't feel broken when someone
     # just says "hi".
     if sender_id not in AWAITING_EMAIL and chat_mode(sender_id):
-        if not await chat_with_gemini(sender_id, " ".join(texts)):
-            await send_category_menu(sender_id)  # Gemini failed: the old product message
+        async with CHAT_LOCKS.setdefault(sender_id, asyncio.Lock()):
+            if not await chat_with_gemini(sender_id, " ".join(texts)):
+                await send_category_menu(sender_id)  # Gemini failed: the old product message
         return
     if sender_id not in AWAITING_EMAIL:
         if any(kw in combined_lower for kw in MENU_TRIGGER_KEYWORDS):

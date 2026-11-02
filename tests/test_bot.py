@@ -557,6 +557,7 @@ def test_meta_calls_wait_longer_than_httpx_default(monkeypatch):
 def chat(owner, monkeypatch):
     """Chat mode turned on for customer 555 only, with manual payments."""
     bot.CHAT_HISTORY.clear()
+    bot.CHAT_LOCKS.clear()
     monkeypatch.setattr(bot, "PAYMENT_MODE", "manual")
     monkeypatch.setattr(bot, "CHAT_MODE_PSIDS", {"555"})
     monkeypatch.setattr(bot, "log_new_order", lambda *a, **k: None)
@@ -644,3 +645,38 @@ def test_chat_mode_messenger_menu_shows_the_product_without_a_button(secrets_and
     asyncio.run(bot.handle_messaging_event(event))
     assert [m for _, m in secrets_and_stubs] == [{"text": bot.build_selected_text(PRODUCT)}]
     assert chat["menu"] == []
+
+
+def test_chat_mode_drops_a_greeting_mid_conversation(secrets_and_stubs, chat, monkeypatch):
+    gemini_returns(monkeypatch, {"reply": "Сайн байна уу! 😊 Үнэ нь 15000₮.", "needs_owner": False,
+                                 "small_talk": False, "product_index": None, "wants_to_buy": False})
+    bot.remember_chat("555", "Customer", "hi")
+    bot.remember_chat("555", "Shop", "Сайн байна уу!")
+    asyncio.run(bot.process_text_messages("555", ["үнэ хэд вэ"]))
+    assert secrets_and_stubs[-1][1] == {"text": "Үнэ нь 15000₮."}
+
+
+def test_chat_mode_first_reply_keeps_its_greeting(secrets_and_stubs, chat, monkeypatch):
+    gemini_returns(monkeypatch, {"reply": "Сайн байна уу! Үнэ нь 15000₮.", "needs_owner": False,
+                                 "small_talk": False, "product_index": None, "wants_to_buy": False})
+    asyncio.run(bot.process_text_messages("555", ["hi"]))
+    assert secrets_and_stubs[-1][1] == {"text": "Сайн байна уу! Үнэ нь 15000₮."}
+
+
+def test_chat_mode_answers_one_message_at_a_time(secrets_and_stubs, chat, monkeypatch):
+    prompts = []
+
+    async def slow_gemini(parts, schema, timeout=None):
+        prompts.append(parts[0]["text"])
+        await asyncio.sleep(0.05)
+        return {"reply": f"хариу {len(prompts)}", "needs_owner": False, "small_talk": False,
+                "product_index": None, "wants_to_buy": False}
+
+    monkeypatch.setattr(bot, "gemini_json", slow_gemini)
+
+    async def two_messages():
+        await asyncio.gather(bot.process_text_messages("555", ["hi"]),
+                             bot.process_text_messages("555", ["Excel"]))
+
+    asyncio.run(two_messages())
+    assert "Shop: хариу 1" in prompts[1]  # the second waited for the first reply
