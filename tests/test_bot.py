@@ -546,3 +546,65 @@ def test_meta_calls_wait_longer_than_httpx_default(monkeypatch):
     monkeypatch.setattr(bot.httpx, "AsyncClient", client)
     asyncio.run(bot.reply_to_comment("c1", "hi"))
     assert seen["timeout"].read >= 15
+
+
+@pytest.fixture
+def chat(owner, monkeypatch):
+    """Chat mode turned on for customer 555 only, with manual payments."""
+    monkeypatch.setattr(bot, "PAYMENT_MODE", "manual")
+    monkeypatch.setattr(bot, "CHAT_MODE_PSIDS", {"555"})
+    monkeypatch.setattr(bot, "log_new_order", lambda *a, **k: None)
+    monkeypatch.setattr(bot, "COMMENTER_NAMES", {"555": "Test"})
+    return owner
+
+
+def test_chat_mode_reply_has_no_buy_button(secrets_and_stubs, chat, monkeypatch):
+    seen = {}
+
+    async def fake_gemini(parts, schema):
+        seen["prompt"] = parts[0]["text"]
+        return {"reply": "Сайн байна уу! Excel-ийг юунд ашиглах гэж байгаа вэ?", "needs_owner": False,
+                "small_talk": False, "product_index": 1, "wants_to_buy": False}
+
+    monkeypatch.setattr(bot, "gemini_json", fake_gemini)
+    asyncio.run(bot.process_text_messages("555", ["menu"]))  # even a menu keyword just gets the chat reply
+    assert [m for _, m in secrets_and_stubs] == [{"text": "Сайн байна уу! Excel-ийг юунд ашиглах гэж байгаа вэ?"}]
+    assert chat["menu"] == [] and "555" not in bot.AWAITING_PAYMENT_SCREENSHOT
+    assert "CHAT:" in seen["prompt"] and "авах гэдгээ бичихэд" in seen["prompt"]
+
+
+def test_chat_mode_sends_bank_details_when_they_want_to_buy(secrets_and_stubs, chat, monkeypatch):
+    gemini_returns(monkeypatch, {"reply": "Тэгье!", "needs_owner": False, "small_talk": False,
+                                 "product_index": None, "wants_to_buy": True})
+    asyncio.run(bot.process_text_messages("555", ["авъя"]))
+    texts = [m["text"] for _, m in secrets_and_stubs]
+    assert texts[0] == "Тэгье!" and texts[1].startswith(bot.CUSTOM_PAYMENT_TEXT[:10])
+    order_id = bot.AWAITING_PAYMENT_SCREENSHOT["555"]
+    assert bot.INVOICES[order_id]["product_index"] == 1
+
+
+def test_chat_mode_falls_back_to_the_product_message(secrets_and_stubs, chat, monkeypatch):
+    gemini_returns(monkeypatch, bot.GeminiError("busy"))
+    asyncio.run(bot.process_text_messages("555", ["сайн уу"]))
+    assert chat["menu"] == ["555"]
+
+
+def test_chat_mode_is_only_for_listed_customers(secrets_and_stubs, chat, monkeypatch):
+    gemini_returns(monkeypatch, {"reply": "Сайн уу", "needs_owner": False, "small_talk": False,
+                                 "product_index": None, "wants_to_buy": True})
+    asyncio.run(bot.process_text_messages("777", ["сайн уу"]))
+    assert chat["menu"] == ["777"] and "777" not in bot.AWAITING_PAYMENT_SCREENSHOT
+
+
+def test_chat_mode_greets_an_ad_click_without_buttons(secrets_and_stubs, chat):
+    event = {"sender": {"id": "555"}, "timestamp": 20, "referral": {"source": "ADS"}}
+    asyncio.run(bot.handle_messaging_event(event))
+    assert [m for _, m in secrets_and_stubs] == [{"text": bot.CHAT_GREETING_TEXT}]
+    assert chat["menu"] == []
+
+
+def test_chat_mode_accepts_a_screenshot_without_a_buy_step(secrets_and_stubs, chat, monkeypatch):
+    monkeypatch.setattr(bot, "find_pending_manual_order_by_psid", lambda psid: None)
+    gemini_returns(monkeypatch, {**GOOD_RECEIPT, "transfer_date": None})
+    asyncio.run(bot.handle_messaging_event(photo_event("p9")))
+    assert len(chat["delivered"]) == 1 and chat["delivered"][0].startswith("555-1-")
