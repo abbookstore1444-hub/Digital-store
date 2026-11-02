@@ -551,6 +551,7 @@ def test_meta_calls_wait_longer_than_httpx_default(monkeypatch):
 @pytest.fixture
 def chat(owner, monkeypatch):
     """Chat mode turned on for customer 555 only, with manual payments."""
+    bot.CHAT_HISTORY.clear()
     monkeypatch.setattr(bot, "PAYMENT_MODE", "manual")
     monkeypatch.setattr(bot, "CHAT_MODE_PSIDS", {"555"})
     monkeypatch.setattr(bot, "log_new_order", lambda *a, **k: None)
@@ -578,7 +579,7 @@ def test_chat_mode_sends_bank_details_when_they_want_to_buy(secrets_and_stubs, c
                                  "product_index": None, "wants_to_buy": True})
     asyncio.run(bot.process_text_messages("555", ["авъя"]))
     texts = [m["text"] for _, m in secrets_and_stubs]
-    assert texts[0] == "Тэгье!" and texts[1].startswith(bot.CUSTOM_PAYMENT_TEXT[:10])
+    assert len(texts) == 1 and texts[0].startswith(bot.CUSTOM_PAYMENT_TEXT[:10])  # no extra line first
     order_id = bot.AWAITING_PAYMENT_SCREENSHOT["555"]
     assert bot.INVOICES[order_id]["product_index"] == 1
 
@@ -608,3 +609,26 @@ def test_chat_mode_accepts_a_screenshot_without_a_buy_step(secrets_and_stubs, ch
     gemini_returns(monkeypatch, {**GOOD_RECEIPT, "transfer_date": None})
     asyncio.run(bot.handle_messaging_event(photo_event("p9")))
     assert len(chat["delivered"]) == 1 and chat["delivered"][0].startswith("555-1-")
+
+
+def test_chat_mode_remembers_the_conversation(secrets_and_stubs, chat, monkeypatch):
+    prompts = []
+
+    async def fake_gemini(parts, schema):
+        prompts.append(parts[0]["text"])
+        return {"reply": f"хариу {len(prompts)}", "needs_owner": False, "small_talk": False,
+                "product_index": None, "wants_to_buy": False}
+
+    monkeypatch.setattr(bot, "gemini_json", fake_gemini)
+    asyncio.run(bot.process_text_messages("555", ["hi"]))
+    asyncio.run(bot.process_text_messages("555", ["Excel"]))
+    assert "CONVERSATION SO FAR" not in prompts[0]
+    assert "Customer: hi\nShop: хариу 1" in prompts[1]
+
+
+def test_chat_mode_comment_gets_the_product_text(secrets_and_stubs, chat, monkeypatch):
+    monkeypatch.setattr(bot, "comment_reply_circuit_breaker_tripped", lambda: True)  # skip like/public reply
+    value = {"item": "comment", "verb": "add", "comment_id": "c9", "message": "үнэ хэд вэ",
+             "from": {"id": "555", "name": "Test"}}
+    asyncio.run(bot.handle_feed_change(value))
+    assert secrets_and_stubs == [({"comment_id": "c9"}, {"text": bot.build_selected_text(PRODUCT)})]
